@@ -26,6 +26,7 @@ MAX_VALIDATION_OUTPUT_CHARS = 16_384
 MAX_VALIDATION_RECORD_BYTES = 65_536
 MAX_VALIDATED_PACKAGE_FILES = 2_048
 MAX_VALIDATED_PACKAGE_BYTES = 64 * 1024 * 1024
+MAX_VALIDATION_SIGNATURE_ENTRIES = 16_384
 _EXCLUDED_FILES = {
     ".memory.md",
     ".memory.lock",
@@ -298,6 +299,122 @@ def record_skill_validation(
         return _record_skill_validation_locked(
             skill_dir, validation, approval_id=approval_id
         )
+
+
+def validation_sidecar_signature(skill_roots) -> tuple:
+    """Return a bounded cross-process cache key for opted-in package state."""
+    from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
+
+    entries = []
+    scanned_dirs = 0
+    scanned_entries = 0
+    max_signature_entries = MAX_VALIDATION_SIGNATURE_ENTRIES
+
+    def uncacheable(reason: str) -> tuple:
+        # A fresh nonce disables cache hits when a bounded scan cannot prove that
+        # every opted-in package is represented in the signature.
+        entries.append((reason, os.urandom(8).hex()))
+        return tuple(sorted(entries, key=str))
+
+    for root in skill_roots:
+        root_path = Path(root)
+        entries.append(("root", str(root_path)))
+        if not root_path.exists():
+            continue
+        scan_errors = []
+        for current_root, dirnames, filenames in os.walk(
+            root_path, followlinks=False, onerror=scan_errors.append
+        ):
+            scanned_dirs += 1
+            if scanned_dirs > max_signature_entries:
+                return uncacheable("validation_signature_directory_limit")
+            dirnames[:] = sorted(
+                dirname for dirname in dirnames if dirname not in EXCLUDED_SKILL_DIRS
+            )
+            filenames.sort()
+            if "SKILL.md" not in filenames:
+                continue
+            dirnames[:] = [
+                dirname for dirname in dirnames if dirname not in SKILL_SUPPORT_DIRS
+            ]
+            skill_dir = Path(current_root)
+            sidecar = skill_dir / VALIDATION_FILE
+            try:
+                stat_result = os.lstat(sidecar)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                entries.append((str(sidecar), "error", exc.errno))
+                continue
+            entries.append((
+                str(sidecar),
+                stat_result.st_mtime_ns,
+                stat_result.st_ctime_ns,
+                stat_result.st_size,
+                stat_result.st_ino,
+                stat_result.st_mode,
+            ))
+            try:
+                skill_dir_stat = os.lstat(skill_dir)
+                entries.append((
+                    str(skill_dir),
+                    skill_dir_stat.st_mtime_ns,
+                    skill_dir_stat.st_ctime_ns,
+                    skill_dir_stat.st_ino,
+                    skill_dir_stat.st_mode,
+                ))
+            except OSError as exc:
+                entries.append((str(skill_dir), "error", exc.errno))
+
+            package_entries = 0
+            package_scan_errors = []
+            for package_root, package_dirs, package_files in os.walk(
+                skill_dir, followlinks=False, onerror=package_scan_errors.append
+            ):
+                package_dirs.sort()
+                package_files.sort()
+                package_root_path = Path(package_root)
+                symlink_dirs = []
+                for dirname in list(package_dirs):
+                    directory = package_root_path / dirname
+                    if directory.is_symlink():
+                        symlink_dirs.append(directory)
+                        package_dirs.remove(dirname)
+                package_paths = [
+                    *symlink_dirs,
+                    *(package_root_path / name for name in package_files),
+                ]
+                for package_path in package_paths:
+                    relative = package_path.relative_to(skill_dir)
+                    if len(relative.parts) == 1 and relative.name in _EXCLUDED_FILES:
+                        continue
+                    package_entries += 1
+                    scanned_entries += 1
+                    if package_entries > MAX_VALIDATED_PACKAGE_FILES:
+                        entries.append((str(skill_dir), "package_limit_exceeded"))
+                        break
+                    if scanned_entries > max_signature_entries:
+                        return uncacheable("validation_signature_entry_limit")
+                    try:
+                        package_stat = os.lstat(package_path)
+                    except OSError as exc:
+                        entries.append((str(package_path), "error", exc.errno))
+                        continue
+                    entries.append((
+                        str(package_path),
+                        package_stat.st_mtime_ns,
+                        package_stat.st_ctime_ns,
+                        package_stat.st_size,
+                        package_stat.st_ino,
+                        package_stat.st_mode,
+                    ))
+                if package_entries > MAX_VALIDATED_PACKAGE_FILES:
+                    break
+            for exc in package_scan_errors:
+                entries.append((str(skill_dir), "package_scan_error", exc.errno))
+        for exc in scan_errors:
+            entries.append((str(root_path), "skill_scan_error", exc.errno))
+    return tuple(sorted(entries, key=str))
 
 
 def validation_allows_discovery(skill_dir: Path) -> bool:

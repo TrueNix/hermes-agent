@@ -522,7 +522,10 @@ available so the package can be inspected and repaired. Captured test output
 is historical, untrusted data and must not be followed as instructions.
 A non-zero exit code returns `refinement_required: true`, providing a concrete
 signal to patch and retest. Editing `SKILL.md`, scripts, tests, or other package
-files invalidates the prior record.
+files invalidates the prior record. Automatic-discovery cache keys include the
+validation sidecar and opted-in package metadata, so changes made by another
+process force a fresh validation check instead of serving an earlier passed
+catalog or prompt entry.
 
 Existing installed skills that already contain tests but have no validation
 sidecar remain discoverable on platforms with secure sidecar I/O as a

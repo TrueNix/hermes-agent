@@ -111,7 +111,8 @@ def clear_skills_discovery_cache() -> None:
 def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
     """Cheap change-signature for the skill scan inputs.
 
-    O(#dirs + #categories) stat calls, not a recursive walk. Includes the
+    Walks skill metadata roots and additionally stats packages that opted into
+    validation. Includes the
     platform the scan's ``skill_matches_platform`` filter will use (read
     from ``agent.skill_utils``'s ``sys`` so test patches of that module
     are honored) — the scan result is platform-dependent.
@@ -138,7 +139,10 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
         except OSError:
             pass
         sig.append((str(d), m))
-    return (tuple(sig), frozenset(disabled), platform)
+    from tools.skill_validation import validation_sidecar_signature
+
+    lifecycle_signature = validation_sidecar_signature(dirs_to_scan)
+    return (tuple(sig), frozenset(disabled), platform, lifecycle_signature)
 
 
 # All skills live in ~/.hermes/skills/ (seeded from bundled skills/ on install).
@@ -683,7 +687,8 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         List of skill metadata dicts (name, description, category).
 
     Results are cached per-session; the cache is invalidated when the scan
-    signature changes (dir/category mtimes or the disabled-set) and expires
+    signature changes (dir/category mtimes, the disabled-set, or validation
+    sidecar/opted-in package metadata) and expires
     after a short TTL to bound staleness from in-place SKILL.md edits.
     """
     from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
