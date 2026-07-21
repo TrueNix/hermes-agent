@@ -104,7 +104,9 @@ jobs:
   contributor-check:
     name: Check contributors
     needs: detect
-    if: needs.detect.outputs.python == 'true'
+    # Internal non-main base branches can contain historical commits that are
+    # intentionally outside the PR diff; the upstream attribution check assumes main.
+    if: needs.detect.outputs.python == 'true' && github.base_ref == 'main'
     uses: ./.github/workflows/contributor-check.yml
     secrets: inherit
 
