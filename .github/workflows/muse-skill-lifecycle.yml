@@ -1,0 +1,51 @@
+name: MUSE Skill Lifecycle CI
+
+on:
+  pull_request:
+    branches: [muse-lifecycle-base]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: muse-skill-lifecycle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --locked --python 3.11 --extra dev
+
+      - name: Ruff
+        run: >-
+          uv run ruff check
+          agent/prompt_builder.py agent/redact.py
+          hermes_cli/write_approval_commands.py
+          tools/write_approval.py tools/memory_tool.py
+          tools/skill_sidecar_io.py tools/skill_experience.py
+          tools/skill_validation.py tools/skill_manager_tool.py tools/skills_tool.py
+          tests/agent/test_prompt_builder.py tests/agent/test_redact.py
+          tests/tools/test_skill_experience.py tests/tools/test_skill_validation.py
+          tests/tools/test_write_approval.py
+
+      - name: Focused tests
+        run: >-
+          uv run pytest -q
+          tests/agent/test_prompt_builder.py tests/agent/test_redact.py
+          tests/tools/test_skill_experience.py tests/tools/test_skill_validation.py
+          tests/tools/test_write_approval.py
