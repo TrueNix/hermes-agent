@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing as mp
+import os
 import threading
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import contextmanager
@@ -407,6 +408,185 @@ def test_validation_gates_system_prompt_and_invalidates_cached_pass(tmp_path):
     assert "validated-skill" not in pending_prompt
     assert "validated-skill" in passed_prompt, passed_record
     assert "validated-skill" not in failed_prompt
+
+
+def test_cross_process_validation_change_invalidates_prompt_cache(tmp_path):
+    import importlib
+
+    prompt_builder = importlib.import_module("agent.prompt_builder")
+
+    with isolated_skills(tmp_path) as skills_dir:
+        skill_dir = create_code_skill(PASSING_TEST, tmp_path)
+        passed = json.loads(
+            skill_manage(
+                action="validate",
+                name="validated-skill",
+                validation=evidence(skill_dir, 0, "passed"),
+            )
+        )
+        assert passed["success"]
+        with (
+            patch.object(prompt_builder, "get_skills_dir", return_value=skills_dir),
+            patch.object(
+                prompt_builder, "get_all_skills_dirs", return_value=[skills_dir]
+            ),
+            patch.object(
+                prompt_builder, "get_disabled_skill_names", return_value=set()
+            ),
+            patch.object(
+                prompt_builder,
+                "_skills_prompt_snapshot_path",
+                return_value=tmp_path / "snapshot.json",
+            ),
+        ):
+            prompt_builder.clear_skills_system_prompt_cache(clear_snapshot=True)
+            cached_prompt = prompt_builder.build_skills_system_prompt()
+            record_path = skill_dir / ".validation.json"
+            original_stat = record_path.stat()
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            record["status"] = "failed"
+            record["exit_code"] = 1
+            record_path.write_text(
+                json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            assert record_path.stat().st_size == original_stat.st_size
+            os.utime(
+                record_path,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
+
+            refreshed_prompt = prompt_builder.build_skills_system_prompt()
+
+    assert "validated-skill" in cached_prompt
+    assert "validated-skill" not in refreshed_prompt
+
+
+def test_cross_process_validation_change_invalidates_catalog_cache(tmp_path):
+    from tools.skills_tool import skills_list
+
+    with isolated_skills(tmp_path):
+        skill_dir = create_code_skill(PASSING_TEST, tmp_path)
+        passed = json.loads(
+            skill_manage(
+                action="validate",
+                name="validated-skill",
+                validation=evidence(skill_dir, 0, "passed"),
+            )
+        )
+        assert passed["success"]
+        cached = json.loads(skills_list())
+        record_path = skill_dir / ".validation.json"
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["status"] = "failed"
+        record["exit_code"] = 1
+        record["output"] = "failed in another process"
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+
+        refreshed = json.loads(skills_list())
+
+    assert "validated-skill" in {item["name"] for item in cached["skills"]}
+    assert "validated-skill" not in {item["name"] for item in refreshed["skills"]}
+
+
+def test_cross_process_package_mutation_invalidates_discovery_caches(tmp_path):
+    import importlib
+
+    prompt_builder = importlib.import_module("agent.prompt_builder")
+    from tools.skills_tool import skills_list
+
+    with isolated_skills(tmp_path) as skills_dir:
+        skill_dir = create_code_skill(PASSING_TEST, tmp_path)
+        passed = json.loads(
+            skill_manage(
+                action="validate",
+                name="validated-skill",
+                validation=evidence(skill_dir, 0, "passed"),
+            )
+        )
+        assert passed["success"]
+        with (
+            patch.object(prompt_builder, "get_skills_dir", return_value=skills_dir),
+            patch.object(
+                prompt_builder, "get_all_skills_dirs", return_value=[skills_dir]
+            ),
+            patch.object(
+                prompt_builder, "get_disabled_skill_names", return_value=set()
+            ),
+            patch.object(
+                prompt_builder,
+                "_skills_prompt_snapshot_path",
+                return_value=tmp_path / "snapshot.json",
+            ),
+        ):
+            prompt_builder.clear_skills_system_prompt_cache(clear_snapshot=True)
+            cached_prompt = prompt_builder.build_skills_system_prompt()
+            cached_catalog = json.loads(skills_list())
+            package_file = skill_dir / "scripts" / "add.py"
+            original_stat = package_file.stat()
+            package_file.write_text(
+                "def add(left, right):\n    return left - right\n",
+                encoding="utf-8",
+            )
+            assert package_file.stat().st_size == original_stat.st_size
+            os.utime(
+                package_file,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
+
+            refreshed_prompt = prompt_builder.build_skills_system_prompt()
+            refreshed_catalog = json.loads(skills_list())
+
+    assert "validated-skill" in cached_prompt
+    assert "validated-skill" not in refreshed_prompt
+    assert "validated-skill" in {item["name"] for item in cached_catalog["skills"]}
+    assert "validated-skill" not in {
+        item["name"] for item in refreshed_catalog["skills"]
+    }
+
+
+def test_validation_signature_limit_disables_cache_reuse(tmp_path):
+    import tools.skill_validation as validation
+
+    with isolated_skills(tmp_path) as skills_dir:
+        create_code_skill(PASSING_TEST, tmp_path)
+        with patch.object(validation, "MAX_VALIDATION_SIGNATURE_ENTRIES", 1):
+            first = validation.validation_sidecar_signature([skills_dir])
+            second = validation.validation_sidecar_signature([skills_dir])
+
+    assert first != second
+    assert any("validation_signature_" in str(entry[0]) for entry in first)
+
+
+def test_validation_signature_enforces_per_package_bound(tmp_path):
+    import tools.skill_validation as validation
+
+    with isolated_skills(tmp_path) as skills_dir:
+        create_code_skill(PASSING_TEST, tmp_path)
+        with patch.object(validation, "MAX_VALIDATED_PACKAGE_FILES", 1):
+            signature = validation.validation_sidecar_signature([skills_dir])
+
+    assert any(
+        len(entry) > 1 and entry[1] == "package_limit_exceeded"
+        for entry in signature
+    )
+
+
+def test_validation_signature_does_not_follow_symlink_cycles(tmp_path):
+    import tools.skill_validation as validation
+
+    with isolated_skills(tmp_path) as skills_dir:
+        skill_dir = create_code_skill(PASSING_TEST, tmp_path)
+        cycle = skill_dir / "scripts" / "cycle"
+        try:
+            cycle.symlink_to(skill_dir, target_is_directory=True)
+        except OSError:
+            return
+
+        signature = validation.validation_sidecar_signature([skills_dir])
+
+    assert any(str(cycle) == entry[0] for entry in signature)
+    assert len(signature) < 100
 
 
 def test_validation_sidecar_symlink_is_not_read(tmp_path):
