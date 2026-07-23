@@ -473,3 +473,63 @@ def test_skill_patch_off_silent_verbose_shows_diff():
     )
     assert len(verbose) == 1
     assert "demo" in verbose[0] and "→" in verbose[0]
+
+
+def test_skill_review_prompt_carries_execution_linked_evidence():
+    from agent.background_review import spawn_background_review_thread
+
+    agent = _bare_agent()
+    _target, prompt = spawn_background_review_thread(
+        agent,
+        [{"role": "user", "content": "task"}],
+        review_skills=True,
+        skill_evidence=["deployment-patterns", "systematic-debugging"],
+    )
+
+    assert "Execution-linked skill evidence" in prompt
+    assert "deployment-patterns" in prompt
+    assert "systematic-debugging" in prompt
+    assert "correction, failed attempt followed by recovery" in prompt
+    assert "Loading a skill alone is not evidence" in prompt
+
+
+def test_skill_evidence_requires_successful_skill_view_result():
+    from agent.background_review import collect_completed_turn_skill_evidence
+
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "view-ok",
+                    "function": {
+                        "name": "skill_view",
+                        "arguments": _json.dumps({"name": "systematic-debugging"}),
+                    },
+                },
+                {
+                    "id": "view-failed",
+                    "function": {
+                        "name": "skill_view",
+                        "arguments": _json.dumps({"name": "missing-skill"}),
+                    },
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "view-ok",
+            "content": _json.dumps(
+                {"success": True, "name": "systematic-debugging"}
+            ),
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "view-failed",
+            "content": _json.dumps({"success": False, "error": "not found"}),
+        },
+    ]
+
+    assert collect_completed_turn_skill_evidence(messages) == [
+        "systematic-debugging"
+    ]

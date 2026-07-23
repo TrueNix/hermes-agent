@@ -16,6 +16,7 @@ Improvements over v2:
   - Richer tool call/result detail in summarizer input
 """
 
+import copy
 import hashlib
 import json
 import logging
@@ -1666,6 +1667,8 @@ class ContextCompressor(ContextEngine):
         # Lets the boundary wrapper distinguish a completed rewrite from a
         # no-op/abort without inferring progress from message-list length.
         self._last_compression_made_progress: bool = False
+        self._last_compression_level: int | None = None
+        self._last_level1_projection: Optional[List[Dict[str, Any]]] = None
         self._summary_failure_cooldown_until: float = 0.0
         # True while the live local cooldown failed to persist to the DB;
         # a refresh must then treat an empty durable row as unknown, not
@@ -4054,6 +4057,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._last_aux_model_failure_model = None
         self._last_compress_aborted = False
         self._last_compression_made_progress = False
+        self._last_compression_level = None
+        self._last_level1_projection = None
         # NOTE: do NOT reset _last_summary_auth_failure or
         # _last_summary_network_failure here.  These flags are set by
         # _generate_summary() on a terminal failure and are already cleared on
@@ -4098,6 +4103,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
 
         # Phase 1: Prune old tool results (cheap, no LLM call)
+        level_one_input_estimate = estimate_messages_tokens_rough(messages)
         messages, pruned_count = self._prune_old_tool_results(
             messages, protect_tail_count=self.protect_last_n,
             protect_tail_tokens=self.tail_token_budget,
@@ -4116,6 +4122,27 @@ This compaction should PRIORITISE preserving all information related to the focu
                 if idx not in blank_echo_indices
             ]
             n_messages = len(messages)
+
+        if pruned_count or blank_echo_indices:
+            self._last_level1_projection = copy.deepcopy(messages)
+            level_one_output_estimate = estimate_messages_tokens_rough(messages)
+            level_one_saved = max(
+                0, level_one_input_estimate - level_one_output_estimate
+            )
+            estimated_prompt_after_level_one = max(0, display_tokens - level_one_saved)
+            if not force and estimated_prompt_after_level_one < self.threshold_tokens:
+                self._last_compression_level = 1
+                self._last_compression_savings_pct = (
+                    level_one_saved / level_one_input_estimate * 100
+                    if level_one_input_estimate > 0
+                    else 0.0
+                )
+                self.compression_count += 1
+                telemetry["compression_level"] = 1
+                telemetry["chunk_count"] = 0
+                _strip_persistence_markers(messages)
+                self._last_compression_made_progress = True
+                return messages
         latest_actionable_idx = self._find_last_user_message_idx(messages, 0)
 
         # Phase 2: Determine boundaries
@@ -4603,6 +4630,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         # are positional; this single terminal sweep makes it structural so a
         # future copy site cannot re-leak the marker into the child-session flush.
         _strip_persistence_markers(compressed)
+        self._last_compression_level = 2
+        telemetry["compression_level"] = 2
         self._last_compression_made_progress = True
 
         return compressed

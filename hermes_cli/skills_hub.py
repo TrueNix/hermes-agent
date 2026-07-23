@@ -1567,8 +1567,15 @@ def _github_publish(skill_path: Path, skill_name: str, target_repo: str,
         return False, f"Failed to create branch: {e}"
 
     # 5. Upload skill files
-    for f in skill_path.rglob("*"):
-        if not f.is_file():
+    private_sidecars = {
+        ".memory.md",
+        ".memory.lock",
+        ".validation.json",
+        ".validation.lock",
+        ".lifecycle.lock",
+    }
+    for f in sorted(skill_path.rglob("*")):
+        if not f.is_file() or f.name in private_sidecars:
             continue
         rel = str(f.relative_to(skill_path))
         upload_path = f"skills/{skill_name}/{rel}"

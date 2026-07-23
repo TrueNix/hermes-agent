@@ -66,6 +66,68 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+def _record_context_dag_turn(
+    agent,
+    messages,
+    *,
+    current_turn_user_idx,
+    turn_id,
+    turn_exit_reason,
+    completed,
+    interrupted,
+    failed,
+    api_call_count,
+) -> None:
+    """Append the finalized turn to the immutable shadow context ledger."""
+    db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if (
+        db is None
+        or not session_id
+        or not isinstance(current_turn_user_idx, int)
+        or not 0 <= current_turn_user_idx < len(messages)
+    ):
+        return
+
+    from hermes_state import context_hash
+
+    conversation_id = db.get_context_conversation_id(session_id)
+    parent_id = db.get_context_active_tip_node_id(conversation_id)
+    input_context_hash = context_hash(messages[:current_turn_user_idx])
+    parent_node = db.get_context_node(parent_id) if parent_id else None
+    storage_mode = (
+        "delta"
+        if parent_node is not None
+        and parent_node["output_context_hash"] == input_context_hash
+        else "checkpoint"
+    )
+    db.append_context_node(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        event_key=f"turn:{turn_id}",
+        kind="turn",
+        storage_mode=storage_mode,
+        input_context_hash=input_context_hash,
+        output_messages=messages,
+        payload_messages=(
+            messages if storage_mode == "checkpoint"
+            else messages[current_turn_user_idx:]
+        ),
+        parent_node_ids=[parent_id] if parent_id else [],
+        metadata={
+            "turn_id": turn_id,
+            "turn_exit_reason": str(turn_exit_reason),
+            "completed": bool(completed),
+            "interrupted": bool(interrupted),
+            "failed": bool(failed),
+            "api_call_count": api_call_count,
+            "model": getattr(agent, "model", None),
+            "provider": getattr(agent, "provider", None),
+            "canonical_resync": bool(storage_mode == "checkpoint" and parent_id),
+        },
+    )
+
+
 def finalize_turn(
     agent,
     *,
@@ -83,6 +145,7 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    current_turn_user_idx=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -90,6 +153,17 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+
+    _turn_skill_evidence = []
+    if isinstance(current_turn_user_idx, int) and 0 <= current_turn_user_idx < len(messages):
+        try:
+            from agent.background_review import collect_completed_turn_skill_evidence
+
+            _turn_skill_evidence = collect_completed_turn_skill_evidence(
+                messages[current_turn_user_idx:]
+            )
+        except Exception:
+            logger.debug("could not collect completed-turn skill evidence", exc_info=True)
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -320,6 +394,23 @@ def finalize_turn(
         if callable(_apply_override):
             _apply_override(messages)
         agent._persist_session(messages, conversation_history)
+        try:
+            _record_context_dag_turn(
+                agent,
+                messages,
+                current_turn_user_idx=current_turn_user_idx,
+                turn_id=turn_id,
+                turn_exit_reason=_turn_exit_reason,
+                completed=completed,
+                interrupted=interrupted,
+                failed=failed,
+                api_call_count=api_call_count,
+            )
+        except Exception:
+            logger.warning(
+                "finalize_turn: immutable context DAG append failed",
+                exc_info=True,
+            )
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
@@ -579,6 +670,12 @@ def finalize_turn(
             and "skill_manage" in agent.valid_tool_names):
         _should_review_skills = True
         agent._iters_since_skill = 0
+    if (
+        completed
+        and _turn_skill_evidence
+        and "skill_manage" in agent.valid_tool_names
+    ):
+        _should_review_skills = True
 
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
@@ -596,6 +693,7 @@ def finalize_turn(
                 messages_snapshot=list(messages),
                 review_memory=_should_review_memory,
                 review_skills=_should_review_skills,
+                skill_evidence=_turn_skill_evidence,
             )
         except Exception:
             pass  # Background review is best-effort

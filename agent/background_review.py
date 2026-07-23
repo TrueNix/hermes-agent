@@ -21,11 +21,89 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
+
+_SKILL_ACTIVATION_PATTERNS = (
+    re.compile(r'user has invoked the "([^"]+)" skill', re.IGNORECASE),
+    re.compile(r'loaded as part of the [^\n]* "([^"]+)"', re.IGNORECASE),
+    re.compile(r'session with the "([^"]+)" skill preloaded', re.IGNORECASE),
+)
+
+
+def collect_completed_turn_skill_evidence(messages: List[Dict]) -> List[str]:
+    """Return skills successfully activated or viewed in one completed turn."""
+    names: List[str] = []
+    pending_views: Dict[str, str] = {}
+
+    def _add(name: Any) -> None:
+        value = str(name or "").strip()
+        if value and value not in names:
+            names.append(value)
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") in {"user", "system"}:
+            text = _msg_text(message)
+            for pattern in _SKILL_ACTIVATION_PATTERNS:
+                for match in pattern.finditer(text):
+                    _add(match.group(1))
+
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") or {}
+                if function.get("name") != "skill_view":
+                    continue
+                raw_arguments = function.get("arguments") or {}
+                if isinstance(raw_arguments, dict):
+                    arguments = raw_arguments
+                else:
+                    try:
+                        arguments = json.loads(raw_arguments)
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                call_id = str(call.get("id") or "")
+                name = str(arguments.get("name") or "").strip()
+                if call_id and name:
+                    pending_views[call_id] = name
+        elif message.get("role") == "tool":
+            call_id = str(message.get("tool_call_id") or "")
+            requested_name = pending_views.get(call_id)
+            if not requested_name:
+                continue
+            raw_result = message.get("content") or {}
+            if isinstance(raw_result, dict):
+                result = raw_result
+            else:
+                try:
+                    result = json.loads(raw_result)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+            if isinstance(result, dict) and result.get("success") is True:
+                _add(result.get("name") or requested_name)
+
+    return names
+
+
+def _skill_evidence_prompt(skill_evidence: List[str]) -> str:
+    names = ", ".join(dict.fromkeys(skill_evidence))
+    return (
+        "\n\n[Execution-linked skill evidence]\n"
+        f"Skills successfully activated or consulted in the completed turn: {names}.\n"
+        "Only append per-skill experience when the transcript demonstrates a "
+        "correction, failed attempt followed by recovery, or a reusable improvement "
+        "backed by verification. Loading a skill alone is not evidence that its "
+        "instructions succeeded. Use skill_manage(action=\"remember\", name=..., "
+        "experience=...) for concise evidence-linked observations; otherwise do not "
+        "write skill experience."
+    )
 
 
 def _run_autonomous_skill_lifecycle(
@@ -1006,6 +1084,7 @@ def spawn_background_review_thread(
     messages_snapshot: List[Dict],
     review_memory: bool = False,
     review_skills: bool = False,
+    skill_evidence: Optional[List[str]] = None,
 ):
     """Build the review thread target and prompt for a background review.
 
@@ -1022,6 +1101,8 @@ def spawn_background_review_thread(
         prompt = getattr(agent, "_MEMORY_REVIEW_PROMPT", _MEMORY_REVIEW_PROMPT)
     else:
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
+    if review_skills and skill_evidence:
+        prompt += _skill_evidence_prompt(skill_evidence)
 
     def _target() -> None:
         _run_review_in_thread(agent, messages_snapshot, prompt)
@@ -1036,4 +1117,5 @@ __all__ = [
     "spawn_background_review_thread",
     "summarize_background_review_actions",
     "build_memory_write_metadata",
+    "collect_completed_turn_skill_evidence",
 ]

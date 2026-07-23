@@ -1497,8 +1497,11 @@ def _resolve_explicit_runtime(
         elif provider == "xai":
             api_mode = "codex_responses"
         else:
+            configured_provider = str(model_cfg.get("provider") or "").strip().lower()
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if configured_mode:
+            if configured_mode and _provider_supports_explicit_api_mode(
+                provider, configured_provider
+            ):
                 api_mode = configured_mode
             else:
                 # Auto-detect from URL (Anthropic /anthropic suffix,

@@ -564,6 +564,22 @@ class TestBuildPreloadedSkillsPrompt:
         assert missing == []
         assert loaded == ["first-skill", "second-skill"]
 
+    def test_includes_accumulated_skill_experience(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "experienced-skill")
+            (skill_dir / ".memory.md").write_text(
+                "## Prior observation\nUse the verified fallback sequence.\n"
+            )
+            prompt, loaded, missing = build_preloaded_skills_prompt(
+                ["experienced-skill"]
+            )
+
+        assert loaded == ["experienced-skill"]
+        assert missing == []
+        assert "Accumulated skill experience" in prompt
+        assert "Use the verified fallback sequence." in prompt
+        assert "untrusted historical observations" in prompt
+
 
 class TestBuildSkillInvocationMessage:
     def test_loads_skill_by_stored_path_when_frontmatter_name_differs(self, tmp_path):
@@ -598,6 +614,20 @@ Generate some audio.
         assert msg is not None
         assert "test-skill" in msg
         assert "do stuff" in msg
+
+    def test_includes_accumulated_skill_experience(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "experienced-skill")
+            (skill_dir / ".memory.md").write_text(
+                "## Prior observation\nRetry once after refreshing metadata.\n"
+            )
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/experienced-skill", "run it")
+
+        assert msg is not None
+        assert "Accumulated skill experience" in msg
+        assert "Retry once after refreshing metadata." in msg
+        assert "SKILL.md and current user intent take precedence" in msg
 
     def test_returns_none_for_unknown(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):

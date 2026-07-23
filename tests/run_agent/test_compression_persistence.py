@@ -236,7 +236,54 @@ class TestFlushAfterCompression:
                 f"Expected {len(compressed)} rows in child session, got {len(child_rows)}. "
                 f"_db_persisted marker propagation bug (#57491)."
             )
+            nodes = db.list_context_nodes(parent_sid)
+            assert len(nodes) == 1
+            assert nodes[0]["kind"] == "compression"
+            checkpoint = db.get_context_node(nodes[0]["id"], decode_payload=True)
+            assert checkpoint["session_id"] == child_sid
+            assert checkpoint["storage_mode"] == "checkpoint"
+            assert checkpoint["payload"] == [
+                {key: value for key, value in message.items() if key != "_db_persisted"}
+                for message in compressed
+            ]
             db.close()
+
+    def test_context_dag_failure_does_not_rollback_committed_rotation(self, monkeypatch):
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            parent_sid = "20260701_152840_parent"
+            db.create_session(parent_sid, "gateway", model="test/model")
+            agent = self._make_agent(db)
+            agent.session_id = parent_sid
+            agent.compression_in_place = False
+            agent._ensure_db_session()
+            monkeypatch.setattr(
+                db,
+                "append_context_node",
+                lambda **_kwargs: (_ for _ in ()).throw(
+                    RuntimeError("dag unavailable")
+                ),
+            )
+            messages = [
+                {"role": "user" if i % 2 == 0 else "assistant", "content": str(i)}
+                for i in range(12)
+            ]
+
+            with patch(
+                "agent.context_compressor.call_llm",
+                side_effect=RuntimeError("no provider"),
+            ):
+                compressed, _ = compress_context(
+                    agent, messages, approx_tokens=100_000, system_message="sys"
+                )
+
+            assert agent.session_id != parent_sid
+            assert db.get_session(agent.session_id) is not None
+            assert db.get_messages(agent.session_id)
+            assert compressed
 
 
 # ---------------------------------------------------------------------------

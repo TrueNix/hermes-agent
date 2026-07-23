@@ -15,6 +15,7 @@ Key design decisions:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -24,6 +25,8 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
+import zlib
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -153,7 +156,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
 # state_meta key ``fts_storage_version``. The main schema version advances
@@ -1006,6 +1009,56 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     delivery_claimed_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS context_nodes (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL,
+    event_key TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL CHECK (kind IN ('turn', 'compression')),
+    storage_mode TEXT NOT NULL CHECK (storage_mode IN ('delta', 'checkpoint')),
+    input_context_hash TEXT,
+    output_context_hash TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    payload_codec TEXT NOT NULL DEFAULT 'zlib-json-v1',
+    metadata_json TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS context_edges (
+    child_node_id TEXT NOT NULL REFERENCES context_nodes(id) ON DELETE CASCADE,
+    parent_node_id TEXT NOT NULL REFERENCES context_nodes(id) ON DELETE CASCADE,
+    relation TEXT NOT NULL DEFAULT 'active_parent',
+    ordinal INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (child_node_id, parent_node_id, relation)
+);
+
+CREATE TABLE IF NOT EXISTS context_active_heads (
+    conversation_id TEXT PRIMARY KEY,
+    tip_node_id TEXT NOT NULL REFERENCES context_nodes(id) ON DELETE CASCADE,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS context_node_projections (
+    node_id TEXT NOT NULL REFERENCES context_nodes(id) ON DELETE CASCADE,
+    level INTEGER NOT NULL CHECK (level = 1),
+    output_context_hash TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    payload_codec TEXT NOT NULL DEFAULT 'zlib-json-v1',
+    metadata_json TEXT,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (node_id, level)
+);
+
+CREATE TRIGGER IF NOT EXISTS context_nodes_no_update
+BEFORE UPDATE ON context_nodes BEGIN
+    SELECT RAISE(ABORT, 'context nodes are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS context_edges_no_update
+BEFORE UPDATE ON context_edges BEGIN
+    SELECT RAISE(ABORT, 'context edges are immutable');
+END;
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -1016,6 +1069,14 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+CREATE INDEX IF NOT EXISTS idx_context_nodes_session_created
+    ON context_nodes(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_context_nodes_conversation_created
+    ON context_nodes(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_context_nodes_conversation_hash
+    ON context_nodes(conversation_id, output_context_hash);
+CREATE INDEX IF NOT EXISTS idx_context_edges_parent
+    ON context_edges(parent_node_id);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -1034,6 +1095,60 @@ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
 """
+
+
+def _context_json_value(value: Any) -> Any:
+    """Return a deterministic JSON-safe context value without runtime markers."""
+    if isinstance(value, dict):
+        return {
+            str(key): _context_json_value(item)
+            for key, item in value.items()
+            if key != "_db_persisted"
+        }
+    if isinstance(value, (list, tuple)):
+        return [_context_json_value(item) for item in value]
+    return _scrub_surrogates(value)
+
+
+def _context_json_bytes(
+    messages: List[Dict[str, Any]], *, for_hash: bool = False
+) -> bytes:
+    projected = _context_json_value(messages)
+    if for_hash:
+        projected = [
+            {
+                key: value
+                for key, value in message.items()
+                if key != "timestamp" and not key.startswith("_")
+            }
+            for message in projected
+        ]
+    return json.dumps(
+        projected,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def context_hash(messages: List[Dict[str, Any]]) -> str:
+    """Hash the replay-relevant ordered message projection."""
+    return hashlib.sha256(_context_json_bytes(messages, for_hash=True)).hexdigest()
+
+
+def _encode_context_payload(messages: List[Dict[str, Any]]) -> bytes:
+    return zlib.compress(_context_json_bytes(messages), level=6)
+
+
+def _decode_context_payload(payload: bytes, codec: str) -> List[Dict[str, Any]]:
+    if codec != "zlib-json-v1":
+        raise ValueError(f"unsupported context payload codec: {codec}")
+    decoded = json.loads(zlib.decompress(payload).decode("utf-8"))
+    if not isinstance(decoded, list) or not all(
+        isinstance(message, dict) for message in decoded
+    ):
+        raise ValueError("context payload is not a message list")
+    return decoded
 
 # ── Deferred FTS rebuild bookkeeping (schema v23) ──
 # While a background index rebuild is pending, two state_meta keys define
@@ -3309,6 +3424,526 @@ class SessionDB:
                     (session_id,),
                 )
         self._execute_write(_do)
+
+    # ── Immutable context DAG shadow ledger ──
+
+    def append_context_node(
+        self,
+        *,
+        session_id: str,
+        conversation_id: str,
+        event_key: str,
+        kind: str,
+        input_context_hash: Optional[str],
+        output_messages: List[Dict[str, Any]],
+        payload_messages: List[Dict[str, Any]],
+        parent_node_ids: Optional[List[str]] = None,
+        summary_source_node_ids: Optional[List[str]] = None,
+        storage_mode: str = "delta",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Append one immutable context event and its parent edges atomically."""
+        if kind not in {"turn", "compression"}:
+            raise ValueError("context node kind must be 'turn' or 'compression'")
+        if storage_mode not in {"delta", "checkpoint"}:
+            raise ValueError("context storage_mode must be 'delta' or 'checkpoint'")
+        if not session_id or not conversation_id or not event_key:
+            raise ValueError("context node identifiers must be non-empty")
+
+        output_context_hash = context_hash(output_messages)
+        payload = _encode_context_payload(payload_messages)
+        metadata_json = (
+            json.dumps(
+                _context_json_value(metadata),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if metadata is not None
+            else None
+        )
+        parents = list(dict.fromkeys(parent_node_ids or []))
+        summary_sources = list(dict.fromkeys(summary_source_node_ids or []))
+        node_id = uuid.uuid4().hex
+        created_at = time.time()
+
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT * FROM context_nodes WHERE event_key = ?",
+                (event_key,),
+            ).fetchone()
+            if existing is not None:
+                existing_parents = [
+                    (
+                        str(row["parent_node_id"]),
+                        str(row["relation"]),
+                        row["ordinal"],
+                    )
+                    for row in conn.execute(
+                        """SELECT parent_node_id, relation, ordinal
+                           FROM context_edges
+                           WHERE child_node_id = ?
+                             AND relation IN ('active_parent', 'summary_source')
+                           ORDER BY relation, ordinal, parent_node_id""",
+                        (existing["id"],),
+                    ).fetchall()
+                ]
+                requested_parents = sorted(
+                    [
+                        (parent_id, "active_parent", ordinal)
+                        for ordinal, parent_id in enumerate(parents)
+                    ]
+                    + [
+                        (source_id, "summary_source", ordinal)
+                        for ordinal, source_id in enumerate(summary_sources)
+                    ]
+                )
+                same_event = (
+                    existing["session_id"] == session_id
+                    and existing["conversation_id"] == conversation_id
+                    and existing["kind"] == kind
+                    and existing["storage_mode"] == storage_mode
+                    and existing["input_context_hash"] == input_context_hash
+                    and existing["output_context_hash"] == output_context_hash
+                    and bytes(existing["payload"]) == payload
+                    and existing["metadata_json"] == metadata_json
+                    and existing_parents == requested_parents
+                )
+                if not same_event:
+                    raise ValueError(
+                        "context event key already exists with different replay state"
+                    )
+                return str(existing["id"])
+
+            active_head = conn.execute(
+                """SELECT tip_node_id FROM context_active_heads
+                   WHERE conversation_id = ?""",
+                (conversation_id,),
+            ).fetchone()
+            expected_tip_id = (
+                str(active_head["tip_node_id"])
+                if active_head is not None
+                else None
+            )
+            if expected_tip_id is None:
+                latest = conn.execute(
+                    """SELECT id FROM context_nodes
+                       WHERE conversation_id = ?
+                       ORDER BY created_at DESC, id DESC LIMIT 1""",
+                    (conversation_id,),
+                ).fetchone()
+                expected_tip_id = str(latest["id"]) if latest is not None else None
+
+            previous_turn_id = None
+            if kind == "turn":
+                previous_turn = conn.execute(
+                    """SELECT id FROM context_nodes
+                       WHERE conversation_id = ? AND kind = 'turn'
+                       ORDER BY created_at DESC, id DESC LIMIT 1""",
+                    (conversation_id,),
+                ).fetchone()
+                if previous_turn is not None:
+                    previous_turn_id = str(previous_turn["id"])
+
+            conn.execute(
+                """INSERT INTO context_nodes (
+                       id, session_id, conversation_id, event_key, kind,
+                       storage_mode, input_context_hash, output_context_hash,
+                       payload, payload_codec, metadata_json, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'zlib-json-v1', ?, ?)""",
+                (
+                    node_id,
+                    session_id,
+                    conversation_id,
+                    event_key,
+                    kind,
+                    storage_mode,
+                    input_context_hash,
+                    output_context_hash,
+                    payload,
+                    metadata_json,
+                    created_at,
+                ),
+            )
+            for ordinal, parent_node_id in enumerate(parents):
+                if parent_node_id == node_id:
+                    raise ValueError("context node cannot be its own parent")
+                parent = conn.execute(
+                    """SELECT 1 FROM context_nodes
+                       WHERE id = ? AND conversation_id = ?""",
+                    (parent_node_id, conversation_id),
+                ).fetchone()
+                if parent is None:
+                    raise ValueError(
+                        "context parent must belong to the conversation"
+                    )
+                conn.execute(
+                    """INSERT INTO context_edges (
+                           child_node_id, parent_node_id, relation, ordinal
+                       ) VALUES (?, ?, 'active_parent', ?)""",
+                    (node_id, parent_node_id, ordinal),
+                )
+            for ordinal, source_node_id in enumerate(summary_sources):
+                if source_node_id == node_id:
+                    raise ValueError("context summary cannot source itself")
+                source = conn.execute(
+                    """SELECT 1 FROM context_nodes
+                       WHERE id = ? AND conversation_id = ?""",
+                    (source_node_id, conversation_id),
+                ).fetchone()
+                if source is None:
+                    raise ValueError(
+                        "context summary source must belong to the conversation"
+                    )
+                conn.execute(
+                    """INSERT INTO context_edges (
+                           child_node_id, parent_node_id, relation, ordinal
+                       ) VALUES (?, ?, 'summary_source', ?)""",
+                    (node_id, source_node_id, ordinal),
+                )
+            if previous_turn_id is not None:
+                conn.execute(
+                    """INSERT INTO context_edges (
+                           child_node_id, parent_node_id, relation, ordinal
+                       ) VALUES (?, ?, 'history_prev', 0)""",
+                    (node_id, previous_turn_id),
+                )
+                conn.execute(
+                    """INSERT INTO context_edges (
+                           child_node_id, parent_node_id, relation, ordinal
+                       ) VALUES (?, ?, 'history_next', 0)""",
+                    (previous_turn_id, node_id),
+                )
+            first_parent_id = parents[0] if parents else None
+            should_advance_head = (
+                expected_tip_id is None and first_parent_id is None
+            ) or first_parent_id == expected_tip_id
+            if should_advance_head:
+                conn.execute(
+                    """INSERT INTO context_active_heads (
+                           conversation_id, tip_node_id, updated_at
+                       ) VALUES (?, ?, ?)
+                       ON CONFLICT(conversation_id) DO UPDATE SET
+                           tip_node_id = excluded.tip_node_id,
+                           updated_at = excluded.updated_at""",
+                    (conversation_id, node_id, created_at),
+                )
+            return node_id
+
+        return self._execute_write(_do)
+
+    def get_context_node(
+        self, node_id: str, *, decode_payload: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Read one context node without mutating the canonical transcript."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM context_nodes WHERE id = ?", (node_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        metadata_json = result.pop("metadata_json", None)
+        result["metadata"] = json.loads(metadata_json) if metadata_json else None
+        if decode_payload:
+            result["payload"] = _decode_context_payload(
+                result["payload"], result["payload_codec"]
+            )
+        return result
+
+    def list_context_nodes(self, conversation_id: str) -> List[Dict[str, Any]]:
+        """List immutable nodes for a logical conversation in insertion order."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT id, session_id, conversation_id, event_key, kind,
+                          storage_mode, input_context_hash, output_context_hash,
+                          payload_codec, metadata_json, created_at
+                   FROM context_nodes
+                   WHERE conversation_id = ?
+                   ORDER BY created_at, id""",
+                (conversation_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_latest_context_node_id(self, conversation_id: str) -> Optional[str]:
+        """Return the latest persisted context event for a logical conversation."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT id FROM context_nodes
+                   WHERE conversation_id = ?
+                   ORDER BY created_at DESC, id DESC LIMIT 1""",
+                (conversation_id,),
+            ).fetchone()
+        return str(row["id"]) if row is not None else None
+
+    def get_context_active_tip_node_id(self, conversation_id: str) -> Optional[str]:
+        """Return the mutable active tip for a logical conversation."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT tip_node_id FROM context_active_heads
+                   WHERE conversation_id = ?""",
+                (conversation_id,),
+            ).fetchone()
+        if row is not None:
+            return str(row["tip_node_id"])
+        # Additive migration path for databases that already contain v24 DAG
+        # nodes from a pre-active-head build.
+        return self.get_latest_context_node_id(conversation_id)
+
+    def set_context_active_tip(self, conversation_id: str, node_id: str) -> None:
+        """Repoint the active conversation view without mutating DAG history."""
+        def _do(conn):
+            node = conn.execute(
+                """SELECT 1 FROM context_nodes
+                   WHERE id = ? AND conversation_id = ?""",
+                (node_id, conversation_id),
+            ).fetchone()
+            if node is None:
+                raise ValueError("context active tip must belong to the conversation")
+            conn.execute(
+                """INSERT INTO context_active_heads (
+                       conversation_id, tip_node_id, updated_at
+                   ) VALUES (?, ?, ?)
+                   ON CONFLICT(conversation_id) DO UPDATE SET
+                       tip_node_id = excluded.tip_node_id,
+                       updated_at = excluded.updated_at""",
+                (conversation_id, node_id, time.time()),
+            )
+
+        self._execute_write(_do)
+
+    def get_context_parents(self, node_id: str) -> List[str]:
+        """Return active-parent node IDs in deterministic edge order."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT parent_node_id FROM context_edges
+                   WHERE child_node_id = ? AND relation = 'active_parent'
+                   ORDER BY ordinal, parent_node_id""",
+                (node_id,),
+            ).fetchall()
+        return [str(row["parent_node_id"]) for row in rows]
+
+    def get_context_summary_source_node_ids(self, node_id: str) -> List[str]:
+        """Return the original contiguous span replaced by a Level-2 node."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT parent_node_id FROM context_edges
+                   WHERE child_node_id = ? AND relation = 'summary_source'
+                   ORDER BY ordinal, parent_node_id""",
+                (node_id,),
+            ).fetchall()
+        return [str(row["parent_node_id"]) for row in rows]
+
+    def upsert_context_projection(
+        self,
+        *,
+        node_id: str,
+        level: int,
+        projected_messages: List[Dict[str, Any]],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Create or refresh a mutable projection over an immutable node."""
+        if level != 1:
+            raise ValueError("only Level-1 context projections are mutable")
+        payload = _encode_context_payload(projected_messages)
+        output_context_hash = context_hash(projected_messages)
+        metadata_json = (
+            json.dumps(
+                _context_json_value(metadata),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if metadata is not None
+            else None
+        )
+
+        def _do(conn):
+            if conn.execute(
+                "SELECT 1 FROM context_nodes WHERE id = ?", (node_id,)
+            ).fetchone() is None:
+                raise ValueError("context projection source node does not exist")
+            conn.execute(
+                """INSERT INTO context_node_projections (
+                       node_id, level, output_context_hash, payload,
+                       payload_codec, metadata_json, updated_at
+                   ) VALUES (?, ?, ?, ?, 'zlib-json-v1', ?, ?)
+                   ON CONFLICT(node_id, level) DO UPDATE SET
+                       output_context_hash = excluded.output_context_hash,
+                       payload = excluded.payload,
+                       payload_codec = excluded.payload_codec,
+                       metadata_json = excluded.metadata_json,
+                       updated_at = excluded.updated_at""",
+                (
+                    node_id,
+                    level,
+                    output_context_hash,
+                    payload,
+                    metadata_json,
+                    time.time(),
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def get_context_projection(
+        self, node_id: str, *, level: int = 1
+    ) -> Optional[Dict[str, Any]]:
+        """Read a mutable projection while leaving its source node untouched."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT * FROM context_node_projections
+                   WHERE node_id = ? AND level = ?""",
+                (node_id, level),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        metadata_json = result.pop("metadata_json", None)
+        result["metadata"] = json.loads(metadata_json) if metadata_json else None
+        result["payload"] = _decode_context_payload(
+            result["payload"], result["payload_codec"]
+        )
+        return result
+
+    def get_context_history_node_ids(self, conversation_id: str) -> List[str]:
+        """Traverse immutable original-turn history, excluding summaries."""
+        with self._lock:
+            head = self._conn.execute(
+                """SELECT n.id FROM context_nodes n
+                   WHERE n.conversation_id = ? AND n.kind = 'turn'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM context_edges e
+                         WHERE e.child_node_id = n.id
+                           AND e.relation = 'history_prev'
+                     )
+                   ORDER BY n.created_at, n.id LIMIT 1""",
+                (conversation_id,),
+            ).fetchone()
+            if head is None:
+                return []
+            ordered = [str(head["id"])]
+            seen = set(ordered)
+            current = ordered[0]
+            while True:
+                row = self._conn.execute(
+                    """SELECT child_node_id FROM context_edges
+                       WHERE parent_node_id = ? AND relation = 'history_prev'
+                       ORDER BY ordinal, child_node_id LIMIT 1""",
+                    (current,),
+                ).fetchone()
+                if row is None:
+                    break
+                current = str(row["child_node_id"])
+                if current in seen:
+                    raise ValueError("context history contains a cycle")
+                seen.add(current)
+                ordered.append(current)
+        return ordered
+
+    def get_context_active_chain_node_ids(self, tip_node_id: str) -> List[str]:
+        """Walk active-parent edges from a tip and return root-to-tip order."""
+        reverse_order: List[str] = []
+        seen: set[str] = set()
+        current: Optional[str] = tip_node_id
+        with self._lock:
+            while current:
+                if current in seen:
+                    raise ValueError("context active chain contains a cycle")
+                if self._conn.execute(
+                    "SELECT 1 FROM context_nodes WHERE id = ?", (current,)
+                ).fetchone() is None:
+                    return []
+                seen.add(current)
+                reverse_order.append(current)
+                row = self._conn.execute(
+                    """SELECT parent_node_id FROM context_edges
+                       WHERE child_node_id = ? AND relation = 'active_parent'
+                       ORDER BY ordinal, parent_node_id LIMIT 1""",
+                    (current,),
+                ).fetchone()
+                current = str(row["parent_node_id"]) if row is not None else None
+        reverse_order.reverse()
+        return reverse_order
+
+    def replay_context_messages(
+        self, conversation_id: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Reconstruct and verify the active checkpoint/delta chain."""
+        tip_node_id = self.get_context_active_tip_node_id(conversation_id)
+        if tip_node_id is None:
+            return None
+        node_ids = self.get_context_active_chain_node_ids(tip_node_id)
+        if not node_ids:
+            return None
+
+        nodes = []
+        for node_id in node_ids:
+            node = self.get_context_node(node_id, decode_payload=True)
+            if node is None or node["conversation_id"] != conversation_id:
+                return None
+            nodes.append(node)
+
+        checkpoint_idx = max(
+            (
+                idx
+                for idx, node in enumerate(nodes)
+                if node["storage_mode"] == "checkpoint"
+            ),
+            default=-1,
+        )
+        replay: List[Dict[str, Any]] = []
+        start_idx = checkpoint_idx if checkpoint_idx >= 0 else 0
+        for idx, node in enumerate(nodes[start_idx:], start=start_idx):
+            mismatch_is_explicit_checkpoint = False
+            if idx > 0 and node["input_context_hash"]:
+                parent_hash = nodes[idx - 1]["output_context_hash"]
+                metadata = node.get("metadata") or {}
+                mismatch_is_explicit_checkpoint = (
+                    node["storage_mode"] == "checkpoint"
+                    and (
+                        metadata.get("canonical_resync") is True
+                        or metadata.get("source_span_complete") is False
+                    )
+                )
+                if (
+                    parent_hash != node["input_context_hash"]
+                    and not mismatch_is_explicit_checkpoint
+                ):
+                    return None
+            if (
+                idx > start_idx
+                and node["input_context_hash"]
+                and not mismatch_is_explicit_checkpoint
+            ):
+                if context_hash(replay) != node["input_context_hash"]:
+                    return None
+            if node["storage_mode"] == "checkpoint":
+                replay = list(node["payload"])
+            else:
+                replay.extend(node["payload"])
+            if context_hash(replay) != node["output_context_hash"]:
+                return None
+        return replay
+
+    def get_context_messages_or_fallback(
+        self,
+        conversation_id: str,
+        canonical_messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Use verified DAG replay only when it matches canonical model state."""
+        try:
+            replay = self.replay_context_messages(conversation_id)
+        except Exception:
+            logger.warning(
+                "Context DAG replay failed for conversation %s; using canonical transcript",
+                conversation_id,
+                exc_info=True,
+            )
+            return canonical_messages
+        if replay is None or context_hash(replay) != context_hash(canonical_messages):
+            return canonical_messages
+        return replay
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
@@ -6213,6 +6848,7 @@ class SessionDB:
             session_id=session_id,
             include_ancestors=include_ancestors,
             repair_alternation=repair_alternation,
+            prefer_context_dag=not include_inactive,
         )
 
     # Columns every conversation projection decodes. Shared by
@@ -6232,6 +6868,7 @@ class SessionDB:
         session_id: str,
         include_ancestors: bool,
         repair_alternation: bool,
+        prefer_context_dag: bool = True,
     ) -> List[Dict[str, Any]]:
         """Decode fetched message rows into the OpenAI conversation format.
 
@@ -6319,6 +6956,11 @@ class SessionDB:
         # assistant reply immediately following it, so a polluted session
         # resumes clean even if stray rows exist.
         messages = _strip_background_review_harness(messages)
+        if repair_alternation and not include_ancestors and prefer_context_dag:
+            conversation_id = self.get_context_conversation_id(session_id)
+            messages = self.get_context_messages_or_fallback(
+                conversation_id, messages
+            )
         if repair_alternation and messages:
             # Lazy import: hermes_state already depends on agent.* (see
             # sanitize_context above), but keep this optional path from
@@ -6439,6 +7081,53 @@ class SessionDB:
         """
         chain = self._session_lineage_root_to_tip(session_id)
         return (chain[0] if chain and chain[0] else session_id)
+
+    def get_context_conversation_id(self, session_id: str) -> str:
+        """Return the stable compression-lineage id used by the context DAG.
+
+        Usage attribution intentionally groups delegates with their parent via
+        :meth:`get_conversation_root`; model context must not. Delegate and
+        explicit branch sessions therefore own independent DAGs.
+        """
+        with self._lock:
+            existing = self._conn.execute(
+                """SELECT conversation_id FROM context_nodes
+                   WHERE session_id = ?
+                   ORDER BY created_at DESC, id DESC LIMIT 1""",
+                (session_id,),
+            ).fetchone()
+        if existing is not None:
+            return str(existing["conversation_id"])
+
+        current_id = session_id
+        seen: set[str] = set()
+        while current_id and current_id not in seen:
+            seen.add(current_id)
+            current = self.get_session(current_id)
+            if not current:
+                break
+            raw_config = current.get("model_config")
+            try:
+                model_config = (
+                    json.loads(raw_config) if isinstance(raw_config, str) else raw_config
+                ) or {}
+            except (TypeError, json.JSONDecodeError):
+                model_config = {}
+            if not isinstance(model_config, dict):
+                model_config = {}
+            if (
+                model_config.get("_delegate_from") is not None
+                or model_config.get("_branched_from") is not None
+            ):
+                break
+            parent_id = current.get("parent_session_id")
+            if not parent_id:
+                break
+            parent = self.get_session(parent_id)
+            if not parent or parent.get("end_reason") != "compression":
+                break
+            current_id = parent_id
+        return current_id or session_id
 
     def _session_lineage_root_to_tip(self, session_id: str) -> List[str]:
         if not session_id:

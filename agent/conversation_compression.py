@@ -71,6 +71,70 @@ def _emit_compaction_done(agent: Any) -> None:
         logger.debug("status_callback error in compaction completion", exc_info=True)
 
 
+def _record_context_dag_compression(
+    agent: Any,
+    *,
+    before_messages: list[dict],
+    compressed_messages: list[dict],
+    boundary_parent_session_id: str,
+    attempt_id: str,
+    split_status: str,
+    in_place: bool,
+) -> None:
+    """Append a committed compaction checkpoint to the immutable DAG."""
+    db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if db is None or not session_id:
+        return
+
+    from hermes_state import context_hash
+
+    conversation_id = db.get_context_conversation_id(
+        boundary_parent_session_id or session_id
+    )
+    parent_id = db.get_context_active_tip_node_id(conversation_id)
+    parent_node = db.get_context_node(parent_id) if parent_id else None
+    input_context_hash = context_hash(before_messages)
+    source_span_complete = bool(
+        parent_node is not None
+        and parent_node["output_context_hash"] == input_context_hash
+    )
+    compressor = getattr(agent, "context_compressor", None)
+    compression_level = getattr(compressor, "_last_compression_level", 2)
+    level_one_projection = getattr(compressor, "_last_level1_projection", None)
+    if parent_id and source_span_complete and isinstance(level_one_projection, list):
+        db.upsert_context_projection(
+            node_id=parent_id,
+            level=1,
+            projected_messages=level_one_projection,
+            metadata={"strategy": "deterministic_tool_pruning"},
+        )
+    summary_sources = (
+        db.get_context_active_chain_node_ids(parent_id)
+        if parent_id and compression_level == 2 and source_span_complete
+        else []
+    )
+    db.append_context_node(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        event_key=f"compression:{attempt_id}",
+        kind="compression",
+        storage_mode="checkpoint",
+        input_context_hash=input_context_hash,
+        output_messages=compressed_messages,
+        payload_messages=compressed_messages,
+        parent_node_ids=[parent_id] if parent_id else [],
+        summary_source_node_ids=summary_sources,
+        metadata={
+            "attempt_id": attempt_id,
+            "split_status": split_status,
+            "in_place": bool(in_place),
+            "compression_level": compression_level,
+            "source_span_complete": source_span_complete,
+        },
+    )
+
+
 # ── Routine compression status templates ────────────────────────────────────
 # Every ROUTINE (non-failure, non-manual-/compress) compression status line the
 # agent emits lives here so the gateway noise filter and its tests can couple
@@ -1750,6 +1814,23 @@ def compress_context(
             bool(_old_sid) or compacted_in_place
         )
         _boundary_parent = _old_sid or agent.session_id or ""
+
+        if _session_commit_succeeded:
+            try:
+                _record_context_dag_compression(
+                    agent,
+                    before_messages=messages,
+                    compressed_messages=compressed,
+                    boundary_parent_session_id=_boundary_parent,
+                    attempt_id=_attempt_id,
+                    split_status=split_status,
+                    in_place=in_place,
+                )
+            except Exception:
+                logger.warning(
+                    "immutable context DAG compression checkpoint failed",
+                    exc_info=True,
+                )
 
         # Notify the context engine that a compaction boundary occurred. Plugin
         # engines (e.g. hermes-lcm) use boundary_reason="compression" to preserve

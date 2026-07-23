@@ -5,7 +5,14 @@ import pytest
 from rich.console import Console
 
 from cli import ChatConsole
-from hermes_cli.skills_hub import do_check, do_install, do_list, do_update, handle_skills_slash
+from hermes_cli.skills_hub import (
+    _github_publish,
+    do_check,
+    do_install,
+    do_list,
+    do_update,
+    handle_skills_slash,
+)
 
 
 class _DummyLockFile:
@@ -781,3 +788,59 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     # Table render must be suppressed — sink should be empty (no "Searching for:" header).
     assert "Searching for:" not in sink.getvalue()
 
+
+def test_github_publish_excludes_private_skill_sidecars(monkeypatch, tmp_path):
+    skill_dir = tmp_path / "example-skill"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Example")
+    (skill_dir / "scripts" / "run.py").write_text("print('ok')")
+    for private_name in (
+        ".memory.md",
+        ".memory.lock",
+        ".validation.json",
+        ".validation.lock",
+        ".lifecycle.lock",
+    ):
+        (skill_dir / private_name).write_text("private runtime state")
+
+    class Response:
+        def __init__(self, status_code=200, payload=None, text=""):
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.text = text
+
+        def json(self):
+            return self._payload
+
+    uploaded = []
+
+    def fake_post(url, **kwargs):
+        if url.endswith("/forks"):
+            return Response(payload={"full_name": "TrueNix/hermes-agent"})
+        if url.endswith("/pulls"):
+            return Response(201, {"html_url": "https://example.test/pr/1"})
+        return Response()
+
+    def fake_get(url, **kwargs):
+        if "/git/refs/heads/" in url:
+            return Response(payload={"object": {"sha": "base-sha"}})
+        return Response(payload={"default_branch": "main"})
+
+    def fake_put(url, **kwargs):
+        uploaded.append(url.rsplit("/contents/", 1)[1])
+        return Response()
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    monkeypatch.setattr("httpx.get", fake_get)
+    monkeypatch.setattr("httpx.put", fake_put)
+    auth = type("Auth", (), {"get_headers": lambda self: {}})()
+
+    success, _message = _github_publish(
+        skill_dir, "example-skill", "NousResearch/hermes-agent", auth
+    )
+
+    assert success is True
+    assert uploaded == [
+        "skills/example-skill/SKILL.md",
+        "skills/example-skill/scripts/run.py",
+    ]

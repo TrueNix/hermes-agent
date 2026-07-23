@@ -1434,6 +1434,39 @@ def test_model_config_api_mode_ignored_when_provider_differs(monkeypatch):
     assert resolved["api_mode"] == "chat_completions"
 
 
+def test_explicit_runtime_ignores_stale_api_mode_from_previous_provider(monkeypatch):
+    """A pre-init /model switch must not send an API-key provider to /responses.
+
+    Before the first turn, the CLI re-resolves the selected provider with the
+    just-resolved key and base URL as explicit overrides.  Those overrides must
+    not make the persisted api_mode from the previous provider authoritative.
+    """
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.6-sol",
+            "api_mode": "codex_responses",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *a, **k: "alibaba-coding-plan",
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="alibaba-coding-plan",
+        explicit_api_key="coding-plan-key",
+        explicit_base_url="https://coding-intl.dashscope.aliyuncs.com/v1",
+        target_model="qwen3.7-plus",
+    )
+
+    assert resolved["provider"] == "alibaba-coding-plan"
+    assert resolved["api_mode"] == "chat_completions"
+
+
 def test_invalid_api_mode_ignored(monkeypatch):
     """Invalid api_mode values should fall back to chat_completions."""
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")

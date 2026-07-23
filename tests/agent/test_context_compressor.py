@@ -378,14 +378,22 @@ class TestCompress:
         msgs = self._make_messages(10)
         # Default config (abort_on_summary_failure=False) — fallback path
         # increments the count even on summary failure.
-        compressor.compress(msgs)
-        assert compressor.compression_count == 1
-        compressor.compress(msgs)
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=RuntimeError("no provider"),
+        ):
+            compressor.compress(msgs)
+            assert compressor.compression_count == 1
+            compressor.compress(msgs)
         assert compressor.compression_count == 2
 
     def test_protects_first_and_last(self, compressor):
         msgs = self._make_messages(10)
-        result = compressor.compress(msgs)
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=RuntimeError("no provider"),
+        ):
+            result = compressor.compress(msgs)
         # First 2 messages should be preserved (protect_first_n=2)
         # Last 2 messages should be preserved (protect_last_n=2)
         assert result[-1]["content"] == msgs[-1]["content"]

@@ -95,6 +95,8 @@ def _finalize(
     exit_reason,
     api_call_count=60,
     pending_verification_response=None,
+    messages=None,
+    current_turn_user_idx=None,
 ):
     return finalize_turn(
         agent,
@@ -102,7 +104,7 @@ def _finalize(
         api_call_count=api_call_count,
         interrupted=False,
         failed=False,
-        messages=[{"role": "user", "content": "task"}],
+        messages=messages or [{"role": "user", "content": "task"}],
         conversation_history=[],
         effective_task_id="task",
         turn_id="turn",
@@ -111,7 +113,206 @@ def _finalize(
         _should_review_memory=False,
         _turn_exit_reason=exit_reason,
         _pending_verification_response=pending_verification_response,
+        current_turn_user_idx=current_turn_user_idx,
     )
+
+
+def test_completed_skill_turn_triggers_evidence_linked_review(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(max_iterations=60, budget_remaining=10)
+    agent.valid_tool_names = ["skill_manage"]
+    reviews = []
+    agent._spawn_background_review = lambda **kwargs: reviews.append(kwargs)
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                '[IMPORTANT: The user has invoked the "deployment-patterns" '
+                "skill, indicating they want you to follow its instructions. "
+                "The full skill content is loaded below.]"
+            ),
+        },
+        {"role": "assistant", "content": "Completed with verification."},
+    ]
+
+    result = _finalize(
+        agent,
+        final_response="Completed with verification.",
+        exit_reason="text_response(stop)",
+        api_call_count=1,
+        messages=messages,
+        current_turn_user_idx=0,
+    )
+
+    assert result["completed"] is True
+    assert len(reviews) == 1
+    assert reviews[0]["review_skills"] is True
+    assert reviews[0]["skill_evidence"] == ["deployment-patterns"]
+
+
+def test_completed_turn_appends_immutable_context_node(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("sess-test", "test")
+    agent = _LimitAgent(max_iterations=60, budget_remaining=10)
+    agent._session_db = db
+    messages = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "completed"},
+    ]
+
+    _finalize(
+        agent,
+        final_response="completed",
+        exit_reason="text_response(stop)",
+        api_call_count=1,
+        messages=messages,
+        current_turn_user_idx=0,
+    )
+
+    nodes = db.list_context_nodes("sess-test")
+    assert len(nodes) == 1
+    assert nodes[0]["kind"] == "turn"
+    assert nodes[0]["storage_mode"] == "checkpoint"
+    node = db.get_context_node(nodes[0]["id"], decode_payload=True)
+    assert node["payload"] == messages
+    assert node["metadata"]["turn_exit_reason"] == "text_response(stop)"
+
+
+def test_first_context_node_checkpoints_preexisting_history(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("sess-test", "test")
+    agent = _LimitAgent(max_iterations=60, budget_remaining=10)
+    agent._session_db = db
+    messages = [
+        {"role": "user", "content": "earlier"},
+        {"role": "assistant", "content": "history"},
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "completed"},
+    ]
+
+    _finalize(
+        agent,
+        final_response="completed",
+        exit_reason="text_response(stop)",
+        api_call_count=1,
+        messages=messages,
+        current_turn_user_idx=2,
+    )
+
+    node = db.get_context_node(
+        db.get_context_active_tip_node_id("sess-test"), decode_payload=True
+    )
+    assert node["storage_mode"] == "checkpoint"
+    assert node["payload"] == messages
+
+
+def test_canonical_rewrite_forces_next_turn_checkpoint(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("sess-test", "test")
+    old_messages = [{"role": "user", "content": "old branch"}]
+    old_tip = db.append_context_node(
+        session_id="sess-test",
+        conversation_id="sess-test",
+        event_key="turn:old-branch",
+        kind="turn",
+        storage_mode="checkpoint",
+        input_context_hash=None,
+        output_messages=old_messages,
+        payload_messages=old_messages,
+    )
+    agent = _LimitAgent(max_iterations=60, budget_remaining=10)
+    agent._session_db = db
+    rewritten_messages = [
+        {"role": "user", "content": "rewritten task"},
+        {"role": "assistant", "content": "new answer"},
+    ]
+
+    _finalize(
+        agent,
+        final_response="new answer",
+        exit_reason="text_response(stop)",
+        api_call_count=1,
+        messages=rewritten_messages,
+        current_turn_user_idx=0,
+    )
+
+    new_tip = db.get_context_active_tip_node_id("sess-test")
+    assert new_tip != old_tip
+    node = db.get_context_node(new_tip, decode_payload=True)
+    assert node["storage_mode"] == "checkpoint"
+    assert node["payload"] == rewritten_messages
+    assert db.replay_context_messages("sess-test") == rewritten_messages
+
+
+def test_context_dag_failure_does_not_lose_final_response(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("sess-test", "test")
+    monkeypatch.setattr(
+        db,
+        "append_context_node",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("dag unavailable")),
+    )
+    agent = _LimitAgent(max_iterations=60, budget_remaining=10)
+    agent._session_db = db
+
+    result = _finalize(
+        agent,
+        final_response="completed",
+        exit_reason="text_response(stop)",
+        api_call_count=1,
+        messages=[
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "completed"},
+        ],
+        current_turn_user_idx=0,
+    )
+
+    assert result["final_response"] == "completed"
+    assert "cleanup_errors" not in result
+    assert db.list_context_nodes("sess-test") == []
+
+
+def test_canonical_persistence_failure_prevents_context_node(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("sess-test", "test")
+    agent = _LimitAgent(max_iterations=60, budget_remaining=10)
+    agent._session_db = db
+    agent._persist_session = lambda *_a, **_kw: (_ for _ in ()).throw(
+        RuntimeError("canonical write failed")
+    )
+
+    result = _finalize(
+        agent,
+        final_response="completed",
+        exit_reason="text_response(stop)",
+        api_call_count=1,
+        messages=[
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "completed"},
+        ],
+        current_turn_user_idx=0,
+    )
+
+    assert result["final_response"] == "completed"
+    assert result["cleanup_errors"] == [
+        "persist_session: canonical write failed"
+    ]
+    assert db.list_context_nodes("sess-test") == []
 
 
 def test_pending_verify_response_is_preserved_for_cron_delivery(monkeypatch):
