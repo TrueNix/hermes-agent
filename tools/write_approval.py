@@ -108,18 +108,11 @@ def _normalize_enabled(value: Any) -> bool:
 # Pending store (file-backed)
 # ---------------------------------------------------------------------------
 
-_IS_WINDOWS = os.name == "nt"
-
 def _pending_dir(subsystem: str) -> Path:
     return get_hermes_home() / "pending" / subsystem
 
 
 def _fsync_pending_dir(path: Path) -> None:
-    if _IS_WINDOWS:
-        # Windows does not expose POSIX directory fsync through os.open. The
-        # regular file is flushed before os.replace, which is the strongest
-        # portable durability boundary available here.
-        return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     fd = os.open(path, flags)
     try:

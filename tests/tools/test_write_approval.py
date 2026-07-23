@@ -64,19 +64,6 @@ def test_normalize_enabled_coerces_values():
     assert wa._normalize_enabled(None) is False
 
 
-def test_windows_directory_fsync_does_not_open_directory(tmp_path, monkeypatch):
-    from tools import write_approval as wa
-
-    monkeypatch.setattr(wa, "_IS_WINDOWS", True)
-    monkeypatch.setattr(
-        wa.os,
-        "open",
-        lambda *_args, **_kwargs: pytest.fail("directory open should be skipped"),
-    )
-
-    wa._fsync_pending_dir(tmp_path)
-
-
 # ---------------------------------------------------------------------------
 # Memory gate
 # ---------------------------------------------------------------------------
