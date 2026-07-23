@@ -92,6 +92,20 @@ def evidence(skill_dir: Path, exit_code: int, output: str) -> dict:
     }
 
 
+def validate_with_executor(exit_code: int, output: str) -> dict:
+    from tools.skill_lifecycle_orchestrator import TestExecutionResult
+    from tools.skill_test_sandbox import BubblewrapTestExecutor
+
+    class _FakeExecutor:
+        python_executable = "python3"
+
+        def __call__(self, _request):
+            return TestExecutionResult(exit_code, output, "test")
+
+    with patch.object(BubblewrapTestExecutor, "discover", return_value=_FakeExecutor()):
+        return json.loads(skill_manage(action="validate", name="validated-skill"))
+
+
 def _record_in_process(item: tuple[str, dict]) -> dict:
     from tools.skill_validation import record_skill_validation
 
@@ -100,23 +114,13 @@ def _record_in_process(item: tuple[str, dict]) -> dict:
 
 
 def test_validate_records_digest_bound_evidence_and_rejects_token_replay(tmp_path):
+    from tools.skill_validation import record_skill_validation
+
     with isolated_skills(tmp_path):
         skill_dir = create_code_skill(PASSING_TEST, tmp_path)
         submitted = evidence(skill_dir, 0, "1 passed")
-        result = json.loads(
-            skill_manage(
-                action="validate",
-                name="validated-skill",
-                validation=submitted,
-            )
-        )
-        replay = json.loads(
-            skill_manage(
-                action="validate",
-                name="validated-skill",
-                validation=submitted,
-            )
-        )
+        result = record_skill_validation(skill_dir, submitted)
+        replay = record_skill_validation(skill_dir, submitted)
 
     record = json.loads((skill_dir / ".validation.json").read_text(encoding="utf-8"))
     assert result["success"] is True
@@ -126,6 +130,24 @@ def test_validate_records_digest_bound_evidence_and_rejects_token_replay(tmp_pat
     assert record["content_digest"] == result["content_digest"]
     assert replay["success"] is False
     assert "validation_token" in replay["error"]
+
+
+def test_skill_manage_rejects_caller_supplied_validation_evidence(tmp_path):
+    from tools.skill_validation import read_skill_validation
+
+    with isolated_skills(tmp_path):
+        skill_dir = create_code_skill(FAILING_TEST, tmp_path)
+        forged = json.loads(
+            skill_manage(
+                action="validate",
+                name="validated-skill",
+                validation=evidence(skill_dir, 0, "all tests passed"),
+            )
+        )
+
+    assert forged["success"] is False
+    assert "caller-supplied validation evidence" in forged["error"]
+    assert read_skill_validation(skill_dir)["status"] == "pending"
 
 
 def test_content_digest_binds_executable_mode_bits(tmp_path):
@@ -274,7 +296,9 @@ def test_draft_survives_intermediate_script_write(tmp_path):
 
 
 
-def test_tested_package_without_validation_sidecar_is_hidden(tmp_path):
+def test_legacy_tested_package_without_validation_sidecar_remains_discoverable(
+    tmp_path,
+):
     from tools.skill_validation import validation_allows_discovery
 
     with isolated_skills(tmp_path):
@@ -285,10 +309,12 @@ def test_tested_package_without_validation_sidecar_is_hidden(tmp_path):
         (tests_dir / "test_add.py").write_text(PASSING_TEST, encoding="utf-8")
 
         assert not (skill_dir / ".validation.json").exists()
-        assert validation_allows_discovery(skill_dir) is False
+        assert validation_allows_discovery(skill_dir) is True
 
 
 def test_validation_token_is_consumed_atomically_across_threads(tmp_path):
+    from tools.skill_validation import record_skill_validation
+
     with isolated_skills(tmp_path):
         skill_dir = create_code_skill(PASSING_TEST, tmp_path)
         submitted = evidence(skill_dir, 0, "1 passed")
@@ -296,13 +322,7 @@ def test_validation_token_is_consumed_atomically_across_threads(tmp_path):
 
         def submit_once():
             barrier.wait()
-            return json.loads(
-                skill_manage(
-                    action="validate",
-                    name="validated-skill",
-                    validation=submitted,
-                )
-            )
+            return record_skill_validation(skill_dir, submitted)
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(lambda _: submit_once(), range(2)))
@@ -327,24 +347,22 @@ def test_validation_token_is_consumed_atomically_across_processes(tmp_path):
 def test_validate_tested_skill_without_evidence_returns_digest(tmp_path):
     with isolated_skills(tmp_path):
         skill_dir = create_code_skill(PASSING_TEST, tmp_path)
-        result = json.loads(skill_manage(action="validate", name="validated-skill"))
+        with patch(
+            "tools.skill_test_sandbox.BubblewrapTestExecutor.discover",
+            return_value=None,
+        ):
+            result = json.loads(skill_manage(action="validate", name="validated-skill"))
 
     assert result["success"] is False
     assert result["validation_status"] == "pending"
-    assert len(result["validation_token"]) >= 24
+    assert result["executor_available"] is False
     assert result["content_digest"] == evidence(skill_dir, 0, "")["content_digest"]
 
 
 def test_validate_failure_emits_refinement_signal_and_records_failure(tmp_path):
     with isolated_skills(tmp_path):
         skill_dir = create_code_skill(FAILING_TEST, tmp_path)
-        result = json.loads(
-            skill_manage(
-                action="validate",
-                name="validated-skill",
-                validation=evidence(skill_dir, 1, "1 failed"),
-            )
-        )
+        result = validate_with_executor(1, "1 failed")
 
     record = json.loads((skill_dir / ".validation.json").read_text(encoding="utf-8"))
     assert result["success"] is False
@@ -373,13 +391,7 @@ def test_validate_text_only_skill_records_static_validation(tmp_path):
 def test_mutating_executable_skill_content_invalidates_prior_validation(tmp_path):
     with isolated_skills(tmp_path):
         skill_dir = create_code_skill(PASSING_TEST, tmp_path)
-        assert json.loads(
-            skill_manage(
-                action="validate",
-                name="validated-skill",
-                validation=evidence(skill_dir, 0, "passed"),
-            )
-        )["success"]
+        assert validate_with_executor(0, "passed")["success"]
 
         changed = json.loads(
             skill_manage(
@@ -416,13 +428,7 @@ def test_tested_skill_is_hidden_from_catalog_until_validation_passes(tmp_path):
         skill_dir = create_code_skill(PASSING_TEST, tmp_path)
         pending = json.loads(skills_list())
 
-        assert json.loads(
-            skill_manage(
-                action="validate",
-                name="validated-skill",
-                validation=evidence(skill_dir, 0, "passed"),
-            )
-        )["success"]
+        assert validate_with_executor(0, "passed")["success"]
         validated = json.loads(skills_list())
 
     assert "validated-skill" not in {item["name"] for item in pending["skills"]}
@@ -450,6 +456,8 @@ def test_text_only_static_validation_remains_discoverable_after_edit(tmp_path):
 
 
 def test_validation_rejects_evidence_for_an_older_package_digest(tmp_path):
+    from tools.skill_validation import record_skill_validation
+
     with isolated_skills(tmp_path):
         skill_dir = create_code_skill(PASSING_TEST, tmp_path)
         stale = evidence(skill_dir, 0, "passed")
@@ -462,13 +470,7 @@ def test_validation_rejects_evidence_for_an_older_package_digest(tmp_path):
             )
         )["success"]
 
-        result = json.loads(
-            skill_manage(
-                action="validate",
-                name="validated-skill",
-                validation=stale,
-            )
-        )
+        result = record_skill_validation(skill_dir, stale)
 
     assert result["success"] is False
     assert result["validation_status"] == "pending"
@@ -551,44 +553,14 @@ def test_validation_gates_system_prompt_and_invalidates_cached_pass(tmp_path):
             prompt_builder.clear_skills_system_prompt_cache(clear_snapshot=True)
             pending_prompt = prompt_builder.build_skills_system_prompt()
 
-            pending_record = json.loads(
-                (skill_dir / ".validation.json").read_text(encoding="utf-8")
-            )
-            passed = json.loads(
-                skill_manage(
-                    action="validate",
-                    name="validated-skill",
-                    validation={
-                        "content_digest": pending_record["content_digest"],
-                        "validation_token": pending_record["validation_token"],
-                        "command": "pytest",
-                        "exit_code": 0,
-                        "output": "passed",
-                    },
-                )
-            )
+            passed = validate_with_executor(0, "passed")
             assert passed["success"]
             passed_prompt = prompt_builder.build_skills_system_prompt()
             passed_record = json.loads(
                 (skill_dir / ".validation.json").read_text(encoding="utf-8")
             )
 
-            challenge = json.loads(
-                skill_manage(action="validate", name="validated-skill")
-            )
-            failed = json.loads(
-                skill_manage(
-                    action="validate",
-                    name="validated-skill",
-                    validation={
-                        "content_digest": challenge["content_digest"],
-                        "validation_token": challenge["validation_token"],
-                        "command": "pytest",
-                        "exit_code": 1,
-                        "output": "failed",
-                    },
-                )
-            )
+            failed = validate_with_executor(1, "failed")
             assert failed["success"] is False
             failed_prompt = prompt_builder.build_skills_system_prompt()
 
@@ -597,20 +569,14 @@ def test_validation_gates_system_prompt_and_invalidates_cached_pass(tmp_path):
     assert "validated-skill" not in failed_prompt
 
 
-def test_cross_process_validation_change_invalidates_prompt_cache(tmp_path):
+def test_cross_process_validation_change_does_not_mutate_cached_prompt(tmp_path):
     import importlib
 
     prompt_builder = importlib.import_module("agent.prompt_builder")
 
     with isolated_skills(tmp_path) as skills_dir:
         skill_dir = create_code_skill(PASSING_TEST, tmp_path)
-        passed = json.loads(
-            skill_manage(
-                action="validate",
-                name="validated-skill",
-                validation=evidence(skill_dir, 0, "passed"),
-            )
-        )
+        passed = validate_with_executor(0, "passed")
         assert passed["success"]
         with (
             patch.object(prompt_builder, "get_skills_dir", return_value=skills_dir),
@@ -646,7 +612,7 @@ def test_cross_process_validation_change_invalidates_prompt_cache(tmp_path):
             refreshed_prompt = prompt_builder.build_skills_system_prompt()
 
     assert "validated-skill" in cached_prompt
-    assert "validated-skill" not in refreshed_prompt
+    assert refreshed_prompt == cached_prompt
 
 
 def test_cross_process_validation_change_invalidates_catalog_cache(tmp_path):
@@ -654,13 +620,7 @@ def test_cross_process_validation_change_invalidates_catalog_cache(tmp_path):
 
     with isolated_skills(tmp_path):
         skill_dir = create_code_skill(PASSING_TEST, tmp_path)
-        passed = json.loads(
-            skill_manage(
-                action="validate",
-                name="validated-skill",
-                validation=evidence(skill_dir, 0, "passed"),
-            )
-        )
+        passed = validate_with_executor(0, "passed")
         assert passed["success"]
         cached = json.loads(skills_list())
         record_path = skill_dir / ".validation.json"
@@ -676,7 +636,7 @@ def test_cross_process_validation_change_invalidates_catalog_cache(tmp_path):
     assert "validated-skill" not in {item["name"] for item in refreshed["skills"]}
 
 
-def test_cross_process_package_mutation_invalidates_discovery_caches(tmp_path):
+def test_cross_process_package_mutation_refreshes_catalog_not_cached_prompt(tmp_path):
     import importlib
 
     prompt_builder = importlib.import_module("agent.prompt_builder")
@@ -684,13 +644,7 @@ def test_cross_process_package_mutation_invalidates_discovery_caches(tmp_path):
 
     with isolated_skills(tmp_path) as skills_dir:
         skill_dir = create_code_skill(PASSING_TEST, tmp_path)
-        passed = json.loads(
-            skill_manage(
-                action="validate",
-                name="validated-skill",
-                validation=evidence(skill_dir, 0, "passed"),
-            )
-        )
+        passed = validate_with_executor(0, "passed")
         assert passed["success"]
         with (
             patch.object(prompt_builder, "get_skills_dir", return_value=skills_dir),
@@ -725,7 +679,7 @@ def test_cross_process_package_mutation_invalidates_discovery_caches(tmp_path):
             refreshed_catalog = json.loads(skills_list())
 
     assert "validated-skill" in cached_prompt
-    assert "validated-skill" not in refreshed_prompt
+    assert refreshed_prompt == cached_prompt
     assert "validated-skill" in {item["name"] for item in cached_catalog["skills"]}
     assert "validated-skill" not in {
         item["name"] for item in refreshed_catalog["skills"]
@@ -917,13 +871,7 @@ def test_validation_output_redacts_secrets_before_persistence(tmp_path):
     secret = "MY_API_TOKEN=abcdefghijklmnopqrstuv"
     with isolated_skills(tmp_path):
         skill_dir = create_code_skill(PASSING_TEST, tmp_path)
-        result = json.loads(
-            skill_manage(
-                action="validate",
-                name="validated-skill",
-                validation=evidence(skill_dir, 1, f"request failed with {secret}"),
-            )
-        )
+        result = validate_with_executor(1, f"request failed with {secret}")
         persisted = (skill_dir / ".validation.json").read_text(encoding="utf-8")
 
     assert result["success"] is False
@@ -937,6 +885,5 @@ def test_validate_schema_and_tests_directory_are_supported():
 
     properties = SKILL_MANAGE_SCHEMA["parameters"]["properties"]
     assert "validate" in properties["action"]["enum"]
-    assert "content_digest" in properties["validation"]["required"]
-    assert "validation_token" in properties["validation"]["required"]
+    assert "validation" not in properties
     assert _validate_file_path("tests/test_behavior.py") is None

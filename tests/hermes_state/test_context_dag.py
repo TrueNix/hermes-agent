@@ -105,6 +105,54 @@ def test_context_hash_ignores_persistence_only_message_metadata() -> None:
     assert context_hash(model_messages) == context_hash(persisted_messages)
 
 
+def test_context_dag_payload_uses_bounded_multimodal_projection(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    data_url = "data:image/png;base64," + ("A" * 100_000)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "inspect this"},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+            "_runtime_only": data_url,
+        }
+    ]
+
+    node_id = db.append_context_node(
+        session_id="session-a",
+        conversation_id="session-a",
+        event_key="turn:multimodal",
+        kind="turn",
+        input_context_hash=None,
+        output_messages=messages,
+        payload_messages=messages,
+    )
+    payload = db.get_context_node(node_id, decode_payload=True)["payload"]
+
+    assert payload == [{"role": "user", "content": "inspect this\n[screenshot]"}]
+    assert data_url not in repr(payload)
+    assert messages[0]["content"][1]["image_url"]["url"] == data_url
+
+
+def test_context_hash_matches_durable_multimodal_projection() -> None:
+    live = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "inspect this"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAAA"},
+                },
+            ],
+        }
+    ]
+    durable = [{"role": "user", "content": "inspect this\n[screenshot]"}]
+
+    assert context_hash(live) == context_hash(durable)
+
+
 def test_context_event_is_idempotent_but_rejects_conflicting_replay(
     tmp_path: Path,
 ) -> None:
@@ -664,7 +712,9 @@ def test_shadow_dag_does_not_change_resume_projection(tmp_path: Path) -> None:
     assert db.get_messages_as_conversation("session-a") == before
 
 
-def test_live_resume_prefers_hash_equivalent_context_dag_replay(tmp_path: Path) -> None:
+def test_live_resume_keeps_canonical_projection_when_dag_hash_matches(
+    tmp_path: Path,
+) -> None:
     db = _db(tmp_path)
     db.append_message("session-a", "user", "canonical")
     replay = [{"role": "user", "content": "canonical"}]
@@ -683,8 +733,8 @@ def test_live_resume_prefers_hash_equivalent_context_dag_replay(tmp_path: Path) 
         "session-a", repair_alternation=True
     )
 
-    assert restored == replay
-    assert "timestamp" not in restored[0]
+    assert restored[0]["content"] == "canonical"
+    assert "timestamp" in restored[0]
 
 
 def test_live_resume_keeps_canonical_rows_when_dag_replay_is_invalid(

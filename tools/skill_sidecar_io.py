@@ -18,12 +18,94 @@ _DIR_FD_SUPPORTED = (
     and os.rename in os.supports_dir_fd
     and os.unlink in os.supports_dir_fd
 )
+_WINDOWS_PATH_BACKEND = os.name == "nt"
 
 
 def _local_lock(skill_dir: Path, name: str) -> threading.Lock:
     key = str(skill_dir / name)
     with _LOCAL_LOCK_GUARD:
         return _LOCAL_LOCKS.setdefault(key, threading.Lock())
+
+
+@contextmanager
+def _pin_path_skill_dir(skill_dir: Path) -> Iterator[Path]:
+    """Pin a Windows directory against rename and reject reparse points."""
+    skill_dir = Path(skill_dir)
+    expected = os.lstat(skill_dir)
+    if not stat.S_ISDIR(expected.st_mode) or stat.S_ISLNK(expected.st_mode):
+        raise OSError(f"skill path is not a plain directory: {skill_dir}")
+
+    handle = None
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(skill_dir))
+        invalid_attrs = 0xFFFFFFFF
+        file_attribute_reparse_point = 0x400
+        file_attribute_directory = 0x10
+        if attrs == invalid_attrs or not attrs & file_attribute_directory:
+            raise OSError(f"skill path is not a directory: {skill_dir}")
+        if attrs & file_attribute_reparse_point:
+            raise OSError(f"refusing skill directory reparse point: {skill_dir}")
+
+        create_file = ctypes.windll.kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        handle = create_file(
+            str(skill_dir),
+            0x80000000,  # GENERIC_READ
+            0x1 | 0x2,  # FILE_SHARE_READ | FILE_SHARE_WRITE; no delete share
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+            None,
+        )
+        if handle == wintypes.HANDLE(-1).value:
+            raise ctypes.WinError()
+    try:
+        current = os.lstat(skill_dir)
+        if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+            raise OSError(f"skill directory changed during sidecar open: {skill_dir}")
+        yield skill_dir
+    finally:
+        if handle is not None:
+            ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def _open_path_child(skill_dir: Path, name: str, flags: int, mode: int = 0o600) -> int:
+    path = skill_dir / name
+    try:
+        expected = os.lstat(path)
+    except FileNotFoundError:
+        expected = None
+    if expected is not None and stat.S_ISLNK(expected.st_mode):
+        raise OSError(f"refusing sidecar symlink: {name}")
+    fd = os.open(path, flags, mode)
+    try:
+        current = os.lstat(path)
+        if stat.S_ISLNK(current.st_mode):
+            raise OSError(f"refusing sidecar symlink: {name}")
+        actual = os.fstat(fd)
+        if (actual.st_dev, actual.st_ino) != (current.st_dev, current.st_ino):
+            raise OSError(f"sidecar changed during open: {name}")
+        if expected is not None and (
+            current.st_dev,
+            current.st_ino,
+        ) != (expected.st_dev, expected.st_ino):
+            raise OSError(f"sidecar changed during open: {name}")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def _directory_flags() -> int:
@@ -132,7 +214,7 @@ def _process_lock(fd: int) -> Iterator[None]:
 
 def secure_sidecar_io_available() -> bool:
     """Return whether race-safe directory-relative sidecar I/O is supported."""
-    return _DIR_FD_SUPPORTED
+    return _DIR_FD_SUPPORTED or _WINDOWS_PATH_BACKEND
 
 
 @contextmanager
@@ -142,8 +224,19 @@ def sidecar_lock(
     """Hold a named thread/process lock inside a pinned skill directory."""
     if "/" in lock_name or "\\" in lock_name:
         raise ValueError("sidecar lock names must be direct children")
-    if not _DIR_FD_SUPPORTED:
+    if not secure_sidecar_io_available():
         raise OSError("secure dir_fd sidecar operations are unavailable")
+
+    if not _DIR_FD_SUPPORTED:
+        with _local_lock(skill_dir, lock_name), _pin_path_skill_dir(skill_dir) as pinned:
+            lock_fd = _open_path_child(pinned, lock_name, os.O_RDWR | os.O_CREAT, mode)
+            try:
+                _check_single_link(lock_fd, lock_name)
+                with _process_lock(lock_fd):
+                    yield
+            finally:
+                os.close(lock_fd)
+        return
 
     with _local_lock(skill_dir, lock_name), _open_skill_dir(skill_dir) as dir_fd:
         lock_fd = _open_child(dir_fd, lock_name, os.O_RDWR | os.O_CREAT, mode)
@@ -170,8 +263,39 @@ def append_sidecar(
     """Append one complete block under thread and cross-process locks."""
     if "/" in name or "\\" in name or "/" in lock_name or "\\" in lock_name:
         raise ValueError("sidecar names must be direct children")
-    if not _DIR_FD_SUPPORTED:
+    if not secure_sidecar_io_available():
         raise OSError("secure dir_fd sidecar operations are unavailable")
+
+    if not _DIR_FD_SUPPORTED:
+        with _local_lock(skill_dir, name), _pin_path_skill_dir(skill_dir) as pinned:
+            lock_fd = _open_path_child(
+                pinned, lock_name, os.O_RDWR | os.O_CREAT, mode
+            )
+            try:
+                _check_single_link(lock_fd, lock_name)
+                with _process_lock(lock_fd):
+                    target_fd = _open_path_child(
+                        pinned, name, os.O_RDWR | os.O_APPEND | os.O_CREAT, mode
+                    )
+                    try:
+                        _check_single_link(target_fd, name)
+                        original_size = os.fstat(target_fd).st_size
+                        if not (
+                            dedupe_marker
+                            and _contains_marker(target_fd, dedupe_marker)
+                        ):
+                            try:
+                                _write_all(target_fd, data)
+                                os.fsync(target_fd)
+                            except BaseException:
+                                os.ftruncate(target_fd, original_size)
+                                os.fsync(target_fd)
+                                raise
+                    finally:
+                        os.close(target_fd)
+            finally:
+                os.close(lock_fd)
+        return skill_dir / name
 
     with _local_lock(skill_dir, name), _open_skill_dir(skill_dir) as dir_fd:
         lock_fd = _open_child(
@@ -224,8 +348,36 @@ def read_sidecar(
     """Read a bounded sidecar and report whether older bytes were omitted."""
     if "/" in name or "\\" in name:
         raise ValueError("sidecar names must be direct children")
-    if not _DIR_FD_SUPPORTED:
+    if not secure_sidecar_io_available():
         raise OSError("secure dir_fd sidecar operations are unavailable")
+    if not _DIR_FD_SUPPORTED:
+        try:
+            with _pin_path_skill_dir(skill_dir) as pinned:
+                try:
+                    fd = _open_path_child(pinned, name, os.O_RDONLY)
+                except FileNotFoundError:
+                    return None, False
+                try:
+                    _check_single_link(fd, name)
+                    size = os.fstat(fd).st_size
+                    if size > max_bytes and not tail:
+                        raise ValueError(f"sidecar exceeds {max_bytes:,} bytes")
+                    if tail and size > max_bytes:
+                        os.lseek(fd, -max_bytes, os.SEEK_END)
+                        return os.read(fd, max_bytes), True
+                    chunks: list[bytes] = []
+                    remaining = min(size, max_bytes)
+                    while remaining:
+                        chunk = os.read(fd, remaining)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    return b"".join(chunks), False
+                finally:
+                    os.close(fd)
+        except FileNotFoundError:
+            return None, False
     try:
         with _open_skill_dir(skill_dir) as dir_fd:
             try:
@@ -265,9 +417,29 @@ def atomic_write_sidecar(
     """Atomically replace a direct-child sidecar and fsync its directory."""
     if "/" in name or "\\" in name:
         raise ValueError("sidecar names must be direct children")
-    if not _DIR_FD_SUPPORTED:
+    if not secure_sidecar_io_available():
         raise OSError("secure dir_fd sidecar operations are unavailable")
     temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+    if not _DIR_FD_SUPPORTED:
+        with _local_lock(skill_dir, name), _pin_path_skill_dir(skill_dir) as pinned:
+            fd = _open_path_child(
+                pinned, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode
+            )
+            try:
+                _write_all(fd, data)
+                os.fsync(fd)
+            except BaseException:
+                os.close(fd)
+                (pinned / temporary).unlink(missing_ok=True)
+                raise
+            else:
+                os.close(fd)
+            try:
+                os.replace(pinned / temporary, pinned / name)
+            except BaseException:
+                (pinned / temporary).unlink(missing_ok=True)
+                raise
+        return skill_dir / name
     with _local_lock(skill_dir, name), _open_skill_dir(skill_dir) as dir_fd:
         fd = _open_child(
             dir_fd,

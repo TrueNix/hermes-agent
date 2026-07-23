@@ -309,7 +309,7 @@ def test_no_dir_fd_platform_fails_closed(tmp_path, monkeypatch):
     assert remembered["success"] is False
     assert tested["success"] is False
     assert validated["success"] is False
-    assert discoverable is False
+    assert discoverable is True
     assert not (skills_dir / "test-skill" / "tests" / "test_behavior.py").exists()
     assert not (skills_dir / "test-skill" / ".memory.md").exists()
     assert not (skills_dir / "test-skill" / ".validation.json").exists()

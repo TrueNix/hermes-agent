@@ -243,7 +243,11 @@ class TestFlushAfterCompression:
             assert checkpoint["session_id"] == child_sid
             assert checkpoint["storage_mode"] == "checkpoint"
             assert checkpoint["payload"] == [
-                {key: value for key, value in message.items() if key != "_db_persisted"}
+                {
+                    key: value
+                    for key, value in message.items()
+                    if not key.startswith("_")
+                }
                 for message in compressed
             ]
             db.close()

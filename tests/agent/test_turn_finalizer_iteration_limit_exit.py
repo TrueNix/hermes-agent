@@ -120,6 +120,7 @@ def _finalize(
 def test_completed_skill_turn_triggers_evidence_linked_review(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     agent = _LimitAgent(max_iterations=60, budget_remaining=10)
+    agent._skill_nudge_interval = 10
     agent.valid_tool_names = ["skill_manage"]
     reviews = []
     agent._spawn_background_review = lambda **kwargs: reviews.append(kwargs)
@@ -148,6 +149,37 @@ def test_completed_skill_turn_triggers_evidence_linked_review(monkeypatch):
     assert len(reviews) == 1
     assert reviews[0]["review_skills"] is True
     assert reviews[0]["skill_evidence"] == ["deployment-patterns"]
+
+
+def test_skill_evidence_does_not_override_disabled_nudge_interval(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(max_iterations=60, budget_remaining=10)
+    agent._skill_nudge_interval = 0
+    agent.valid_tool_names = ["skill_manage"]
+    reviews = []
+    agent._spawn_background_review = lambda **kwargs: reviews.append(kwargs)
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                '[IMPORTANT: The user has invoked the "deployment-patterns" '
+                "skill, indicating they want you to follow its instructions.]"
+            ),
+        },
+        {"role": "assistant", "content": "Completed with verification."},
+    ]
+
+    result = _finalize(
+        agent,
+        final_response="Completed with verification.",
+        exit_reason="text_response(stop)",
+        api_call_count=1,
+        messages=messages,
+        current_turn_user_idx=0,
+    )
+
+    assert result["completed"] is True
+    assert reviews == []
 
 
 def test_completed_turn_appends_immutable_context_node(monkeypatch, tmp_path):

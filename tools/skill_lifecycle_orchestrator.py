@@ -90,6 +90,7 @@ def run_skill_lifecycle(
     refine: Optional[SkillRefiner] = None,
     max_refinements: int = 2,
     python_executable: Optional[str] = None,
+    approval_id: str | None = None,
 ) -> SkillLifecycleResult:
     """Evaluate a skill and refine it through a bounded retry loop.
 
@@ -118,6 +119,7 @@ def run_skill_lifecycle(
                 refine=refine,
                 max_refinements=max_refinements,
                 python_executable=python_executable,
+                approval_id=approval_id,
             )
     except OSError as exc:
         return SkillLifecycleResult(
@@ -136,13 +138,14 @@ def _run_skill_lifecycle_locked(
     refine: Optional[SkillRefiner] = None,
     max_refinements: int = 2,
     python_executable: Optional[str] = None,
+    approval_id: str | None = None,
 ) -> SkillLifecycleResult:
     test_attempts = 0
     refinement_attempts = 0
     executable = python_executable or sys.executable
 
     while True:
-        challenge = record_skill_validation(skill_dir)
+        challenge = record_skill_validation(skill_dir, approval_id=approval_id)
         status = str(challenge.get("validation_status") or "invalid")
         digest = str(challenge.get("content_digest") or "")
 
@@ -152,6 +155,19 @@ def _run_skill_lifecycle_locked(
                 registered=validation_allows_discovery(skill_dir),
                 test_attempts=test_attempts,
                 refinement_attempts=refinement_attempts,
+                content_digest=digest,
+            )
+        if approval_id and status in {"passed", "failed"}:
+            return SkillLifecycleResult(
+                status=status,
+                registered=validation_allows_discovery(skill_dir),
+                test_attempts=test_attempts,
+                refinement_attempts=refinement_attempts,
+                message=(
+                    "Skill tests failed; refine the package and validate again."
+                    if status == "failed"
+                    else ""
+                ),
                 content_digest=digest,
             )
         if status != "pending":
@@ -196,6 +212,7 @@ def _run_skill_lifecycle_locked(
                 "exit_code": execution.exit_code,
                 "output": execution.output,
             },
+            approval_id=approval_id,
         )
         evidence_status = str(evidence.get("validation_status") or "invalid")
 

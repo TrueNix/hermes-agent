@@ -1177,23 +1177,77 @@ def _remember_skill(name: str, experience: str) -> Dict[str, Any]:
 
 
 def _validate_skill(name: str, validation: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Record static checks or externally executed test evidence for a skill."""
+    """Validate a skill with static checks or the isolated test executor."""
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    if validation is not None and not _skill_pending_replay_id.get():
+        return {
+            "success": False,
+            "error": (
+                "caller-supplied validation evidence is not accepted; omit "
+                "validation so Hermes can run the package tests internally"
+            ),
+        }
+    # Old pending approval records may contain caller-supplied evidence from a
+    # pre-upgrade schema. Approval replay deliberately ignores those fields and
+    # reruns the fixed internal test request instead of trusting persisted claims.
+    validation = None
     try:
-        skill_content = (existing["path"] / "SKILL.md").read_text(encoding="utf-8")
+        skill_dir = Path(existing["path"])
+        skill_content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
         frontmatter_error = _validate_frontmatter(skill_content)
         if frontmatter_error:
             return {"success": False, "error": frontmatter_error}
 
         from tools.skill_validation import record_skill_validation
 
-        return record_skill_validation(
-            existing["path"],
-            validation,
+        tests_dir = skill_dir / "tests"
+        if not (tests_dir.is_dir() and any(tests_dir.rglob("test_*.py"))):
+            return record_skill_validation(
+                skill_dir,
+                approval_id=_skill_pending_replay_id.get() or None,
+            )
+
+        from tools.skill_lifecycle_orchestrator import run_skill_lifecycle
+        from tools.skill_test_sandbox import BubblewrapTestExecutor
+
+        executor = BubblewrapTestExecutor.discover()
+        if executor is None:
+            pending = record_skill_validation(
+                skill_dir,
+                approval_id=_skill_pending_replay_id.get() or None,
+            )
+            pending["error"] = (
+                "isolated skill test executor is unavailable; validation remains pending"
+            )
+            pending["executor_available"] = False
+            return pending
+
+        outcome = run_skill_lifecycle(
+            skill_dir,
+            execute=executor,
+            refine=None,
+            python_executable=executor.python_executable,
             approval_id=_skill_pending_replay_id.get() or None,
         )
+        result = {
+            "success": outcome.status in {"passed", "static"},
+            "validation_status": outcome.status,
+            "registered": outcome.registered,
+            "test_attempts": outcome.test_attempts,
+            "content_digest": outcome.content_digest,
+        }
+        if outcome.message:
+            result["error"] = outcome.message
+        from tools.skill_validation import read_skill_validation
+
+        record = read_skill_validation(skill_dir)
+        if isinstance(record, dict) and isinstance(record.get("output"), str):
+            result["test_output"] = record["output"]
+        if outcome.status == "failed":
+            result["refinement_required"] = True
+        return result
     except (OSError, ValueError) as exc:
         return {"success": False, "error": str(exc)}
 
@@ -1537,7 +1591,8 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
             result["warning"] = result.pop("error", "Validation state recorded")
             raw = json.dumps(result, ensure_ascii=False)
         elif (
-            payload.get("action") in {"create", "edit", "patch", "write_file"}
+            payload.get("action")
+            in {"create", "edit", "patch", "write_file", "remove_file"}
             and result.get("success") is True
         ):
             # An approved mutation to a tested package leaves it pending and
@@ -1787,7 +1842,7 @@ SKILL_MANAGE_SCHEMA = {
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "
         "remember (append a concise runtime lesson to per-skill memory), "
-        "validate (record static checks or test evidence already produced through terminal/sandbox), "
+        "validate (run static checks or package tests in Hermes' isolated executor), "
         "delete, write_file, remove_file.\n\n"
         "On delete, pass `absorbed_into=<umbrella>` when you're merging this "
         "skill's content into another one, or `absorbed_into=\"\"` when you're "
@@ -1806,10 +1861,9 @@ SKILL_MANAGE_SCHEMA = {
         "Skip for simple one-offs. Confirm with user before creating/deleting.\n\n"
         "Good skills: trigger conditions, numbered steps with exact commands, "
         "pitfalls section, verification steps. Use skill_view() to see format examples.\n\n"
-        "For code-backed skills, add tests under tests/, call validate once to "
-        "obtain the current content digest and one-time validation token, run the tests "
-        "through terminal or a sandbox, then call validate again with both, the command, "
-        "exit code, and bounded output. Failed validation returns refinement_required; patch "
+        "For code-backed skills, add tests under tests/ and call validate. Hermes runs a "
+        "fixed pytest command through its isolated executor and binds the result to the "
+        "current package digest. Failed validation returns refinement_required; patch "
         "and retest. Use remember for concise skill-specific runtime lessons instead "
         "of global memory or stable SKILL.md instructions.\n\n"
         "Pinned skills are protected from deletion only — skill_manage(action='delete') "
@@ -1888,24 +1942,6 @@ SKILL_MANAGE_SCHEMA = {
                     "input quirk, or verified optimization to append to this skill's "
                     "on-demand experience memory."
                 )
-            },
-            "validation": {
-                "type": "object",
-                "description": (
-                    "For 'validate' when tests/ exists — evidence from a test command "
-                    "you already ran through terminal or a sandbox, bound to the "
-                    "content_digest and validation_token returned by an evidence-free "
-                    "validate call. Omit only for the first call or a text-only skill "
-                    "with no tests."
-                ),
-                "properties": {
-                    "content_digest": {"type": "string", "maxLength": 128},
-                    "validation_token": {"type": "string", "maxLength": 128},
-                    "command": {"type": "string", "maxLength": 4096},
-                    "exit_code": {"type": "integer"},
-                    "output": {"type": "string", "maxLength": 16384}
-                },
-                "required": ["content_digest", "validation_token", "command", "exit_code", "output"]
             },
             "absorbed_into": {
                 "type": "string",

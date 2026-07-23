@@ -64,6 +64,19 @@ def test_normalize_enabled_coerces_values():
     assert wa._normalize_enabled(None) is False
 
 
+def test_windows_directory_fsync_does_not_open_directory(tmp_path, monkeypatch):
+    from tools import write_approval as wa
+
+    monkeypatch.setattr(wa, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        wa.os,
+        "open",
+        lambda *_args, **_kwargs: pytest.fail("directory open should be skipped"),
+    )
+
+    wa._fsync_pending_dir(tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # Memory gate
 # ---------------------------------------------------------------------------
@@ -254,20 +267,20 @@ def test_failed_validation_approval_is_consumed_after_record_is_applied(
             file_content="def test_failure():\n    assert False\n",
         )
     )["success"]
-    challenge = json.loads(smt.skill_manage("validate", "failing-skill"))
     _set_approval("skills", True)
-    staged = json.loads(
-        smt.skill_manage(
-            "validate",
-            "failing-skill",
-            validation={
-                "content_digest": challenge["content_digest"],
-                "validation_token": challenge["validation_token"],
-                "command": "pytest",
-                "exit_code": 1,
-                "output": "1 failed",
-            },
-        )
+    staged = json.loads(smt.skill_manage("validate", "failing-skill"))
+
+    class _FailingExecutor:
+        python_executable = "python3"
+
+        def __call__(self, _request):
+            from tools.skill_lifecycle_orchestrator import TestExecutionResult
+
+            return TestExecutionResult(exit_code=1, output="1 failed", isolation="test")
+
+    monkeypatch.setattr(
+        "tools.skill_test_sandbox.BubblewrapTestExecutor.discover",
+        classmethod(lambda cls: _FailingExecutor()),
     )
 
     real_discard = wa.discard_pending
@@ -284,6 +297,72 @@ def test_failed_validation_approval_is_consumed_after_record_is_applied(
     assert wa.list_pending("skills") == []
     assert record["status"] == "failed"
     assert record["approval_id"] == staged["pending_id"]
+
+
+def test_legacy_validation_approval_reexecutes_tests_internally(
+    hermes_home, monkeypatch
+):
+    import importlib
+
+    import tools.skill_manager_tool as smt
+    from tools import write_approval as wa
+
+    importlib.reload(smt)
+    assert json.loads(smt.skill_manage("create", "legacy-approval", content=_SKILL))[
+        "success"
+    ]
+    assert json.loads(
+        smt.skill_manage(
+            "write_file",
+            "legacy-approval",
+            file_path="tests/test_behavior.py",
+            file_content="def test_ok():\n    assert True\n",
+        )
+    )["success"]
+    staged = wa.stage_write(
+        wa.SKILLS,
+        {
+            "action": "validate",
+            "name": "legacy-approval",
+            "validation": {
+                "content_digest": "0" * 64,
+                "validation_token": "legacy-token",
+                "command": "false",
+                "exit_code": 1,
+                "output": "untrusted legacy evidence",
+            },
+        },
+        summary="legacy validation",
+        origin="foreground",
+    )
+
+    class _PassingExecutor:
+        python_executable = "python3"
+
+        def __call__(self, _request):
+            from tools.skill_lifecycle_orchestrator import TestExecutionResult
+
+            return TestExecutionResult(exit_code=0, output="1 passed", isolation="test")
+
+    monkeypatch.setattr(
+        "tools.skill_test_sandbox.BubblewrapTestExecutor.discover",
+        classmethod(lambda cls: _PassingExecutor()),
+    )
+
+    applied = json.loads(smt.apply_skill_pending(staged["payload"]))
+
+    assert applied["success"] is True
+    assert applied["validation_status"] == "passed"
+    record = json.loads(
+        (
+            Path(hermes_home)
+            / "skills"
+            / "legacy-approval"
+            / ".validation.json"
+        ).read_text()
+    )
+    assert record["status"] == "passed"
+    assert record["output"] == "1 passed"
 
 
 def test_approved_tested_skill_write_resumes_lifecycle(hermes_home, monkeypatch):
@@ -332,6 +411,71 @@ def test_approved_tested_skill_write_resumes_lifecycle(hermes_home, monkeypatch)
     from tools.skill_validation import validation_allows_discovery
 
     skill_dir = Path(hermes_home) / "skills" / "resumed-skill"
+    assert validation_allows_discovery(skill_dir) is True
+
+
+def test_approved_tested_skill_remove_file_resumes_lifecycle(
+    hermes_home, monkeypatch
+):
+    import importlib
+
+    import tools.skill_manager_tool as smt
+    from tools import write_approval as wa
+
+    importlib.reload(smt)
+    assert json.loads(smt.skill_manage("create", "remove-resume", content=_SKILL))[
+        "success"
+    ]
+    assert json.loads(
+        smt.skill_manage(
+            "write_file",
+            "remove-resume",
+            file_path="tests/test_behavior.py",
+            file_content="def test_ok():\n    assert True\n",
+        )
+    )["success"]
+    assert json.loads(
+        smt.skill_manage(
+            "write_file",
+            "remove-resume",
+            file_path="references/obsolete.md",
+            file_content="obsolete\n",
+        )
+    )["success"]
+
+    _set_approval("skills", True)
+    staged = json.loads(
+        smt.skill_manage(
+            "remove_file",
+            "remove-resume",
+            file_path="references/obsolete.md",
+        )
+    )
+
+    class _FakeExecutor:
+        python_executable = "python3"
+
+        def __call__(self, _request):
+            from tools.skill_lifecycle_orchestrator import TestExecutionResult
+
+            return TestExecutionResult(exit_code=0, output="1 passed", isolation="test")
+
+    monkeypatch.setattr(
+        "tools.skill_test_sandbox.BubblewrapTestExecutor.discover",
+        classmethod(lambda cls: _FakeExecutor()),
+    )
+
+    record = wa.get_pending("skills", staged["pending_id"])
+    applied = json.loads(smt.apply_skill_pending(record["payload"]))
+
+    assert applied["success"] is True
+    assert applied["lifecycle"]["status"] == "passed"
+    assert applied["lifecycle"]["registered"] is True
+    skill_dir = Path(hermes_home) / "skills" / "remove-resume"
+    assert not (skill_dir / "references" / "obsolete.md").exists()
+
+    from tools.skill_validation import validation_allows_discovery
+
     assert validation_allows_discovery(skill_dir) is True
 
 

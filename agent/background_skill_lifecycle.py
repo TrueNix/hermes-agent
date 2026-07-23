@@ -174,6 +174,17 @@ def run_background_skill_lifecycles(
             # later independent skills from reaching validation. Tested
             # packages without a valid sidecar are hidden by the discovery gate.
             logger.warning("Skill lifecycle failed for %s: %s", name, exc)
+            try:
+                if skill_dir is not None:
+                    from tools.skill_validation import record_invalid_validation
+
+                    record_invalid_validation(skill_dir, str(exc))
+            except Exception:
+                logger.debug(
+                    "Could not persist invalid lifecycle state for %s",
+                    name,
+                    exc_info=True,
+                )
             results[name] = SkillLifecycleResult(
                 status="error",
                 registered=False,

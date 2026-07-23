@@ -671,7 +671,8 @@ def finalize_turn(
         _should_review_skills = True
         agent._iters_since_skill = 0
     if (
-        completed
+        agent._skill_nudge_interval > 0
+        and completed
         and _turn_skill_evidence
         and "skill_manage" in agent.valid_tool_names
     ):

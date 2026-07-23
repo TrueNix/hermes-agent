@@ -486,35 +486,22 @@ rather than falling back to race-prone path-based writes.
 
 ### Validation and refinement evidence
 
-Code-backed skills can place Python tests under `tests/`. First call `validate`
-without evidence to obtain the current package digest. Run the tests with the
-normal `terminal` or sandbox tool, then record the result bound to that digest
-and single-use challenge token:
+Code-backed skills can place Python tests under `tests/`. Call `validate` and
+Hermes constructs a fixed, shell-free pytest request, runs it through the
+isolated skill-test executor, and binds the result to the current package
+digest:
 
 ```text
 skill_manage(action="validate", name="my-skill")
-# → validation_status: pending, content_digest: "abc123...",
-#   validation_token: "one-time-token..."
-
-skill_manage(
-  action="validate",
-  name="my-skill",
-  validation={
-    "content_digest": "abc123...",
-    "validation_token": "one-time-token...",
-    "command": "python -m pytest -q tests",
-    "exit_code": 0,
-    "output": "4 passed",
-  },
-)
+# → validation_status: passed, content_digest: "abc123..."
 ```
 
-The digest and one-time token prevent stale-result replay after package changes.
+The internal digest and one-time token prevent stale-result replay after package changes.
 Generated test-runner artifacts such as `__pycache__`, `.pytest_cache`, bytecode,
 and coverage data are excluded so executing the tests does not invalidate the
-pre-run digest. They do not cryptographically prove that the command ran: use
-a trusted terminal/sandbox result, and enable `skills.write_approval` when human
-attestation is required.
+pre-run digest. Caller-supplied command, exit-code, and output evidence is not
+accepted. If the isolated executor is unavailable, validation remains pending
+and the package stays undiscoverable.
 
 Hermes stores `.validation.json` with the command, bounded output, package
 content digest, and status. Once a skill adds `tests/`, a pending, failed,
@@ -524,19 +511,16 @@ available so the package can be inspected and repaired. Captured test output
 is historical, untrusted data and must not be followed as instructions.
 A non-zero exit code returns `refinement_required: true`, providing a concrete
 signal to patch and retest. Editing `SKILL.md`, scripts, tests, or other package
-files invalidates the prior record. Automatic-discovery cache keys include the
+files invalidates the prior record. Dynamic catalog cache keys include the
 validation sidecar and opted-in package metadata, so changes made by another
-process force a fresh validation check instead of serving an earlier passed
-catalog or prompt entry.
+process force a fresh validation check. An already cached conversation prompt
+remains byte-stable; lifecycle changes take effect in a new prompt/session.
 
 Existing installed skills that already contain tests but have no validation
-sidecar remain discoverable on platforms with secure sidecar I/O as a
-backward-compatible migration policy. Adding
+sidecar remain discoverable as a backward-compatible migration policy. Adding
 or changing tests through `skill_manage` creates the pending sidecar and opts
 the package into gating. Text-only skills without tests can use `validate` for
-static structural validation and remain discoverable after later edits. Hermes deliberately does not execute hidden test code inside `skill_manage`; foreground
-execution stays in the existing terminal/sandbox path, where normal isolation and
-approval policies apply.
+static structural validation and remain discoverable after later edits.
 
 ### Autonomous background lifecycle
 

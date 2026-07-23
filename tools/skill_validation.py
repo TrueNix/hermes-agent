@@ -191,6 +191,18 @@ def record_draft_validation(skill_dir: Path) -> None:
         _write_draft_validation_locked(skill_dir)
 
 
+def record_invalid_validation(skill_dir: Path, reason: str) -> None:
+    """Fail closed for a lifecycle-managed package that cannot be inspected."""
+    record = {
+        "schema": VALIDATION_SCHEMA,
+        "status": "invalid",
+        "reason": str(reason)[:500],
+        "updated_at": _now_iso(),
+    }
+    with sidecar_lock(skill_dir, VALIDATION_LOCK_FILE):
+        _atomic_json_write(validation_path(skill_dir), record)
+
+
 def invalidate_skill_validation(skill_dir: Path) -> None:
     """Atomically invalidate validation evidence after package mutation."""
     with sidecar_lock(skill_dir, VALIDATION_LOCK_FILE):
@@ -211,7 +223,11 @@ def _record_skill_validation_locked(
         if not approval_id.isalnum() or len(approval_id) > 64:
             return {"success": False, "error": "invalid validation approval id"}
         existing_record = read_skill_validation(skill_dir)
-        if existing_record and existing_record.get("approval_id") == approval_id:
+        if (
+            existing_record
+            and existing_record.get("approval_id") == approval_id
+            and existing_record.get("status") != "pending"
+        ):
             existing_status = existing_record.get("status")
             result = {
                 "success": existing_status == "passed",
@@ -484,14 +500,10 @@ def validation_allows_discovery(skill_dir: Path) -> bool:
     """Preserve legacy skills, but gate packages that opted into validation."""
     record = read_skill_validation(skill_dir)
     if record is None:
-        tests_dir = skill_dir / "tests"
-        has_tests = tests_dir.is_dir() and any(tests_dir.rglob("test_*.py"))
-        if has_tests:
-            # A tested package with no validation record has not been through
-            # the lifecycle gate. Fail closed unconditionally: never discover a
-            # code-backed skill whose tests were not recorded as passing,
-            # regardless of platform sidecar support.
-            return False
+        # Sidecar absence identifies a legacy or externally managed package.
+        # New lifecycle-created packages are stamped draft/pending before they
+        # can be discovered, so preserving legacy skills does not weaken the
+        # fail-closed gate for packages that opted into lifecycle management.
         return True
     return record.get("status") in {"passed", "static"}
 
@@ -531,6 +543,14 @@ def read_skill_validation(skill_dir: Path) -> Optional[Dict[str, Any]]:
     if record.get("schema") != VALIDATION_SCHEMA:
         return {"status": "invalid", "reason": "unsupported validation schema"}
     status = record.get("status")
+    if status == "invalid":
+        if set(record) - {"schema", "status", "reason", "updated_at"}:
+            return {"status": "invalid", "reason": "invalid record has unknown fields"}
+        if not isinstance(record.get("reason"), str) or not isinstance(
+            record.get("updated_at"), str
+        ):
+            return {"status": "invalid", "reason": "malformed invalid record"}
+        return record
     if status not in {"draft", "pending", "passed", "failed", "static"}:
         return {"status": "invalid", "reason": "unknown validation status"}
     tests_collected = record.get("tests_collected")

@@ -1516,8 +1516,9 @@ def build_skills_system_prompt(
     """Build a compact skill index for the system prompt.
 
     Two-layer cache:
-      1. In-process LRU dict keyed by skills roots, tools, toolsets, hidden
-         skills, and cross-process validation/package metadata
+      1. In-process LRU dict keyed by skills roots, tools, toolsets, and hidden
+         skills. Lifecycle changes take effect in a new prompt/session rather
+         than mutating a cached conversation prefix.
       2. Disk snapshot (``.skills_prompt_snapshot.json``) validated by
          mtime/size manifest — survives process restarts
 
@@ -1545,9 +1546,6 @@ def build_skills_system_prompt(
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
-    from tools.skill_validation import validation_sidecar_signature
-
-    lifecycle_signature = validation_sidecar_signature([skills_dir, *external_dirs])
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
@@ -1556,7 +1554,6 @@ def build_skills_system_prompt(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
-        lifecycle_signature,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)

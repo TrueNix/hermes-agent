@@ -1110,10 +1110,27 @@ def _context_json_value(value: Any) -> Any:
     return _scrub_surrogates(value)
 
 
+def _context_message_value(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the bounded, replay-relevant durable projection of one message."""
+    from agent.tool_dispatch_helpers import durable_history_content
+
+    projected = {
+        str(key): _context_json_value(value)
+        for key, value in message.items()
+        if not str(key).startswith("_")
+    }
+    for content_key in ("content", "api_content"):
+        if content_key in projected:
+            projected[content_key] = _context_json_value(
+                durable_history_content(projected[content_key])
+            )
+    return projected
+
+
 def _context_json_bytes(
     messages: List[Dict[str, Any]], *, for_hash: bool = False
 ) -> bytes:
-    projected = _context_json_value(messages)
+    projected = [_context_message_value(message) for message in messages]
     if for_hash:
         projected = [
             {
@@ -6848,7 +6865,6 @@ class SessionDB:
             session_id=session_id,
             include_ancestors=include_ancestors,
             repair_alternation=repair_alternation,
-            prefer_context_dag=not include_inactive,
         )
 
     # Columns every conversation projection decodes. Shared by
@@ -6868,7 +6884,6 @@ class SessionDB:
         session_id: str,
         include_ancestors: bool,
         repair_alternation: bool,
-        prefer_context_dag: bool = True,
     ) -> List[Dict[str, Any]]:
         """Decode fetched message rows into the OpenAI conversation format.
 
@@ -6956,11 +6971,6 @@ class SessionDB:
         # assistant reply immediately following it, so a polluted session
         # resumes clean even if stray rows exist.
         messages = _strip_background_review_harness(messages)
-        if repair_alternation and not include_ancestors and prefer_context_dag:
-            conversation_id = self.get_context_conversation_id(session_id)
-            messages = self.get_context_messages_or_fallback(
-                conversation_id, messages
-            )
         if repair_alternation and messages:
             # Lazy import: hermes_state already depends on agent.* (see
             # sanitize_context above), but keep this optional path from
