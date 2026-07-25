@@ -1,10 +1,9 @@
 """Regression tests for the OAuth User-Agent header in anthropic_adapter.py.
 
-Two DIFFERENT Anthropic endpoints impose OPPOSITE User-Agent requirements:
+Two DIFFERENT Anthropic endpoints impose distinct User-Agent requirements:
 
-- Inference (``/v1/messages`` via build_anthropic_client): requires the
-  ``claude-code/`` UA + ``x-app: cli`` fingerprint, or requests get
-  intermittent 500s. (issue #48534: ``claude-cli/`` is 404'd here.)
+- Inference (``/v1/messages`` via build_anthropic_client) matches the current
+  Claude Agent SDK fingerprint: ``claude-cli/... (external, sdk-cli)``.
 - OAuth token endpoint (``/v1/oauth/token`` login exchange + refresh):
   Anthropic now RATE-LIMITS (HTTP 429) any UA whose prefix is ``claude-code/``
   (or ``Mozilla/``). Verified empirically against platform.claude.com:
@@ -22,10 +21,10 @@ import pytest
 
 
 class TestOAuthUserAgentPrefix:
-    """Inference uses ``claude-code/``; the OAuth token endpoint must NOT."""
+    """Inference uses the SDK CLI UA; the OAuth token endpoint must not."""
 
     def test_build_anthropic_client_oauth_ua(self):
-        """build_anthropic_client (INFERENCE) with OAuth token must use claude-code UA."""
+        """OAuth inference must match the current Claude Agent SDK UA."""
         from agent.anthropic_adapter import build_anthropic_client
 
         mock_sdk = MagicMock()
@@ -37,23 +36,25 @@ class TestOAuthUserAgentPrefix:
         headers = call_kwargs.get("default_headers", {})
         ua = headers.get("user-agent", "") or headers.get("User-Agent", "")
 
-        assert "claude-code/" in ua, f"Expected claude-code/ in UA, got: {ua}"
-        assert "claude-cli/" not in ua, f"Must not use claude-cli/ prefix: {ua}"
+        assert "claude-cli/" in ua, f"Expected claude-cli/ in UA, got: {ua}"
+        assert "(external, sdk-cli)" in ua
 
-    def test_no_claude_cli_in_source(self):
-        """Source file must not contain claude-cli/ UA pattern (blocks OAuth)."""
+    def test_no_legacy_claude_code_cli_ua_in_source(self):
+        """Source must not send the obsolete claude-code/(external, cli) UA."""
         import inspect
         import agent.anthropic_adapter as mod
 
         source = inspect.getsource(mod)
-        # Allow claude-cli in comments/strings that reference the old behavior
-        # but not in actual header assignments
         lines = source.split("\n")
         for i, line in enumerate(lines, 1):
             stripped = line.strip()
-            if "claude-cli/" in stripped and ("User-Agent" in stripped or "user-agent" in stripped):
+            if (
+                "claude-code/" in stripped
+                and "(external, cli)" in stripped
+                and ("User-Agent" in stripped or "user-agent" in stripped)
+            ):
                 pytest.fail(
-                    f"Line {i}: claude-cli/ still used in User-Agent header: {stripped}"
+                    f"Line {i}: legacy OAuth User-Agent still present: {stripped}"
                 )
 
     def test_token_exchange_ua_not_throttled(self):
