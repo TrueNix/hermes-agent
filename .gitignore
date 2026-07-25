@@ -175,3 +175,10 @@ apps/desktop/demo/
 # pr-infographic-workflow reference (storage rule + lapse #8 / #COMMIT-1).
 infographic/
 native/fts5_cjk/*.so
+
+# Local Graphify knowledge-graph snapshots and caches. These are generated
+# from the tracked source tree and include files larger than GitHub's 100 MB
+# object limit; keep the reproducible outputs on disk, not in Git history.
+/.planning/graphs/
+/graphify-out/
+/papers/graphify-out/
